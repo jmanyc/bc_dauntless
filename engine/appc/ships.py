@@ -956,6 +956,29 @@ class ShipClass(DamageableObject):
     # BridgeHandlers.py:1442 (bridge crew behavior keys off this).
     def GetAlertLevel(self) -> int:                     return self._alert_level
 
+    def ProcessEvent(self, event) -> None:
+        """Instance handlers first (LIFO chain, TGEventHandlerObject), then the
+        ship's own built-in handling at the end of the chain.
+
+        ET_SET_ALERT_LEVEL is handled natively by the original ShipClass: the
+        event's int is the ship's GREEN/YELLOW/RED_ALERT value. QuickBattle's
+        StartSimulation sends RED_ALERT to the player this way (QuickBattle.py
+        "Switch us to red alert"), and XOMenuHandlers.SetAlertLevel forwards
+        the XO's Green/Yellow/Red Alert buttons the same way -- without this the
+        battle started at green alert with shields down and the XO buttons did
+        nothing. Runs when no handler stops the chain."""
+        super().ProcessEvent(event)
+        try:
+            import App
+            if event.GetEventType() != App.ET_SET_ALERT_LEVEL:
+                return
+            names = self._handlers.get(event.GetEventType(), [])
+            if names and not getattr(event, "_chain_passed", True):
+                return                      # a handler stopped the chain
+            self.SetAlertLevel(int(event.GetInt()))
+        except Exception as e:
+            dev_mode.log_swallowed("ShipClass.ProcessEvent(ET_SET_ALERT_LEVEL)", e)
+
     def SetAlertLevel(self, v) -> None:
         """Apply the alert-level → power policy for weapons and shields.
 
