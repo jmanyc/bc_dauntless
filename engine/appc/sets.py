@@ -71,6 +71,22 @@ class SetEffectRoot:
         return "<SetEffectRoot %r>" % (self._set.GetName(),)
 
 
+def _free_set_ai_trees(pSet) -> None:
+    """A deleted set deletes its objects in BC, and with them their AI trees
+    (engine/appc/ai.py destroy_ai_tree)."""
+    if pSet is None:
+        return
+    from engine.appc.ai import destroy_ai_tree
+    for obj in list(getattr(pSet, "_objects", {}).values()):
+        ai = getattr(obj, "__dict__", {}).get("_ai")
+        if ai is not None:
+            try:
+                destroy_ai_tree(ai)
+            except Exception as _e:
+                dev_mode.log_swallowed("destroy_ai_tree on set delete", _e)
+            obj._ai = None
+
+
 class SetClass(TGEventHandlerObject):
     def __init__(self):
         super().__init__()
@@ -621,9 +637,11 @@ class SetManager:
         self._sets.pop(name, None)
 
     def DeleteSet(self, name: str) -> None:
-        self._sets.pop(name, None)
+        _free_set_ai_trees(self._sets.pop(name, None))
 
     def DeleteAllSets(self) -> None:
+        for pSet in list(self._sets.values()):
+            _free_set_ai_trees(pSet)
         self._sets.clear()
 
     def GetNumSets(self) -> int:

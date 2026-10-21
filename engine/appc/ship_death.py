@@ -203,6 +203,16 @@ def _mark_dead(ship) -> None:
             ship._deactivate_ai_tree(ai)
         except Exception as _e:
             dev_mode.log_swallowed("deactivate AI tree on death", _e)
+        # ...and free it, as the original deletes a dead ship's tree: its
+        # conditions' teardown releases what they registered under the ship's
+        # NAME (ConditionIncomingTorps' module-wide watcher), which the next
+        # ship of that name -- Quick Battle's "Player" -- would otherwise
+        # inherit, bound to this hulk (engine/appc/ai.py destroy_ai_tree).
+        try:
+            from engine.appc.ai import destroy_ai_tree
+            destroy_ai_tree(ai)
+        except Exception as _e:
+            dev_mode.log_swallowed("destroy AI tree on death", _e)
         ship._ai = None
     # Any in-system warp dies with the ship -- through _end_in_system_warp so
     # a player dash still runs its drop-out (ruling R10). Outside the AI

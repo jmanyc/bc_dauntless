@@ -4,6 +4,17 @@ from engine.appc.subsystems import PoweredSubsystem, impulse_output_fraction
 import engine.dev_mode as dev_mode
 
 
+def _deletes_old(extra) -> bool:
+    """SetAI / ClearAI's first trailing flag is 'delete the old AI' (default
+    yes): only an explicit 0 keeps the outgoing tree for reuse."""
+    if not extra:
+        return True
+    try:
+        return bool(int(extra[0]))
+    except (TypeError, ValueError):
+        return True
+
+
 class ShipClass(DamageableObject):
     WG_INVALID = 0
     WG_PRIMARY = 1
@@ -158,6 +169,8 @@ class ShipClass(DamageableObject):
             self._deactivate_ai_tree(old)
             from engine.appc.ai_driver import fire_ai_done
             fire_ai_done(self, old)
+            if _deletes_old(_extra):
+                self._destroy_ai_tree(old)
 
     def ClearAI(self, *_extra) -> None:
         # SDK callers: pPlayer.ClearAI() (MissionLib.SetPlayerAI(ctrl, None))
@@ -173,6 +186,26 @@ class ShipClass(DamageableObject):
             self._deactivate_ai_tree(old)
             from engine.appc.ai_driver import fire_ai_done
             fire_ai_done(self, old)
+            if _deletes_old(_extra):
+                self._destroy_ai_tree(old)
+
+    @staticmethod
+    def _destroy_ai_tree(ai) -> None:
+        """The original DELETES the outgoing tree unless told not to:
+        HelmMenuHandlers.py:2323-2325 -- "The 0 here tells the game not to
+        delete the old AI" -- pShip.ClearAI(0, pOldAI), so a bare ClearAI() /
+        SetAI(new) deletes it. Deleting a C++ tree runs each condition
+        script's teardown (engine/appc/ai.py destroy_ai_tree); without it a
+        finished or replaced tree's name-keyed registrations
+        (ConditionIncomingTorps) outlived it, and the next ship of that name
+        -- Quick Battle's "Player" after a death -- never saw incoming
+        torpedoes again."""
+        try:
+            from engine.appc.ai import destroy_ai_tree
+            destroy_ai_tree(ai)
+        except Exception as _e:
+            import engine.dev_mode as dev_mode
+            dev_mode.log_swallowed("destroy outgoing AI tree", _e)
 
     @staticmethod
     def _deactivate_ai_tree(ai) -> None:

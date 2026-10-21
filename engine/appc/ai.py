@@ -233,6 +233,68 @@ class ConditionScript(TGCondition):
                 dev_mode.log_swallowed("condition Deactivate", _e)
 
 
+_FINALISED: dict = {}
+
+
+def _finalised_class(cls):
+    """`cls` with a no-op __del__: once Destroy has run a script's teardown, a
+    later garbage collection must not run it again."""
+    k = _FINALISED.get(cls)
+    if k is None:
+        k = _FINALISED[cls] = type(cls.__name__, (cls,), {"__del__": lambda self: None})
+    return k
+
+
+def _destroy_condition(cond) -> None:
+    """Run a condition script's own teardown (__del__) once, as BC's C++
+    ConditionScript destructor does when it releases the Python instance."""
+    inst = getattr(cond, "_instance", None)
+    if inst is None:
+        return
+    cond._instance = None
+    fin = getattr(type(inst), "__del__", None)
+    if fin is None:
+        return
+    try:
+        fin(inst)
+    except Exception as _e:
+        dev_mode.log_swallowed("condition teardown (__del__)", _e)
+    try:
+        inst.__class__ = _finalised_class(type(inst))
+    except TypeError:
+        pass
+
+
+def destroy_ai_tree(ai) -> None:
+    """Free `ai`'s whole tree the way the original does when its ship is
+    deleted: every condition script's teardown runs.
+
+    In BC a ship's AI tree is C++; deleting the ship deletes it, each
+    ConditionScript destructor drops its Python script instance and the
+    script's __del__ releases what it holds -- ConditionIncomingTorps its
+    entry in the module-wide g_dInternalInstances (keyed by ship NAMES),
+    ConditionInRange its proximity sphere, the shield / power / system
+    watchers their range checks. Dauntless's tree is Python and was never torn
+    down, so those entries outlived their ships: the next fight with the same
+    names (Quick Battle reuses "Player" / "<Class>-1") inherited a stale
+    torpedo watcher bound to the dead ships, and torpedo evasion never fired
+    again (stbc-oracle condition timelines: Dauntless 0% vs the original
+    35-50% "incoming torps" after the first fight of a session)."""
+    seen = set()
+    stack = [ai]
+    while stack:
+        node = stack.pop()
+        if node is None or id(node) in seen:
+            continue
+        seen.add(id(node))
+        d = getattr(node, "__dict__", {})
+        for c in d.get("_conditions", ()) or ():
+            _destroy_condition(c)
+        stack.append(d.get("_contained_ai"))
+        for e in d.get("_ais", ()) or ():
+            stack.append(e[1] if isinstance(e, tuple) else e)
+
+
 def ConditionScript_Create(module_name: str, class_name: str, *args) -> ConditionScript:
     return ConditionScript(module_name, class_name, *args)
 

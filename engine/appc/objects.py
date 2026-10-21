@@ -1413,6 +1413,16 @@ def broadcast_object_deleted(obj) -> None:
         App.g_kEventManager._log_broadcast_failure(
             "ET_DELETE_OBJECT_PUBLIC -> %s" % (
                 obj.GetName() if hasattr(obj, "GetName") else obj), evt)
+    # The object is leaving the world: free its AI tree with it, as BC does.
+    ai = getattr(obj, "__dict__", {}).get("_ai")
+    if ai is not None:
+        try:
+            from engine.appc.ai import destroy_ai_tree
+            destroy_ai_tree(ai)
+        except Exception as _e:
+            import engine.dev_mode as dev_mode
+            dev_mode.log_swallowed("destroy_ai_tree on delete", _e)
+        obj._ai = None
 
 
 def ObjectClass_Cast(obj) -> "ObjectClass | None":
