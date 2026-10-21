@@ -386,9 +386,18 @@ def install():
         return p
     _patch(Pre.FireScript, "ChooseTargetSubsystem", choose)
 
+    _install_command_hooks()
+    atexit.register(_finish)
+
     # FireScript activity per game second (the twin of CombatTap's FSA rows): [FireSystemAtTarget calls,
-    # CheckGoodShot passes], and every SmartPhaserShot decision.
-    from engine.appc.optimized_fire_script import CompiledFireScriptMixin as _CFS
+    # CheckGoodShot passes], and every SmartPhaserShot decision. Recorded only when a compiled FireScript
+    # exposing those hooks is present.
+    try:
+        from engine.appc.optimized_fire_script import CompiledFireScriptMixin as _CFS
+    except ImportError:
+        return
+    if not all(hasattr(_CFS, n) for n in ("FireSystemAtTarget", "_smart_phaser_shot")):
+        return
 
     def _fs_key(inst, w):
         try:
@@ -437,9 +446,6 @@ def install():
             pass
         return ok
     _patch(_CFS, "_smart_phaser_shot", smart)
-
-    _install_command_hooks()
-    atexit.register(_finish)
 
 
 def _tsub(ship):
