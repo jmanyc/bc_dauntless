@@ -834,6 +834,9 @@ class SequenceAI(ArtificialIntelligence):
         # keeps the remaining-loop count at +0x34 and decrements it on wrap).
         self._loops_remaining: int = 1
         self._reset_if_interrupted: bool = False
+        # Children still owed a Reset() since the last interrupted rewind
+        # (ids); each is reset as the sequence makes it current again.
+        self._children_to_reset: set = set()
         self._double_check_all_done: bool = False
         self._skip_dormant: bool = False
 
@@ -860,11 +863,34 @@ class SequenceAI(ArtificialIntelligence):
     def GetLoopCount(self) -> int:            return self._loop_count
 
     def SetResetIfInterrupted(self, v) -> None:
-        # Stored-but-unused: no tree we currently run depends on this flag,
-        # and its exact semantics are not established by the RE corpus
-        # (ai-architecture.md sec.2 names the field but not its precise
-        # effect). Do not invent behaviour for it.
+        """Restart from the first child whenever this sequence is deactivated.
+
+        Read in exactly one place, ``_on_deactivated``. CloakAttack's
+        OuterSequence sets it, so when EvadeIncomingTorps or WayTooFar takes
+        the priority list away from it, it comes back at
+        FarEnough_TimeNotPassed with its 15 s timer re-armed rather than
+        resuming mid-cycle (cleanroom/spec/05_SequenceAI_ResetIfInterrupted.md).
+        """
         self._reset_if_interrupted = bool(v)
+
+    def _on_deactivated(self) -> None:
+        """Deactivate the current child; with ResetIfInterrupted, rewind.
+
+        The rewind restores the remaining-loop count, drops the current child
+        (the next scan starts at the first child), and marks every child to be
+        Reset() as it becomes current again, before it is activated -- see
+        ai_driver._tick_sequence. With the flag clear the sequence resumes
+        where it was.
+        """
+        kids = self._ais
+        i = self.__dict__.get("_current_index", 0)
+        if 0 <= i < len(kids):
+            kids[i].SetInactive()
+        if not self._reset_if_interrupted:
+            return
+        self._loops_remaining = self._loop_count
+        self._current_index = 0
+        self._children_to_reset = {id(c) for c in kids}
 
     def SetDoubleCheckAllDone(self, v) -> None:
         # Stored-but-unused — see SetResetIfInterrupted above; same

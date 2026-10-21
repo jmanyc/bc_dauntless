@@ -1139,6 +1139,12 @@ def _tick_sequence(ai: SequenceAI, game_time: float) -> int:
             if idx is None:
                 return ai._status
         child = ai._ais[idx]
+        pending = ai.__dict__.get("_children_to_reset")
+        if pending and id(child) in pending:
+            # ResetIfInterrupted rewound this sequence: a child is reset as it
+            # becomes current again, before it is activated or its status read.
+            pending.discard(id(child))
+            child.Reset()
         if isinstance(child, ConditionalAI):
             # A sequence's child is activated as the sequence reaches it, BEFORE its conditions are read:
             # activation re-arms its ConditionTimers (bResetOnActivate). Reading the stale conditions first
