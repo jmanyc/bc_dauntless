@@ -865,8 +865,13 @@ class ShipClass(DamageableObject):
     # times farther out than BC's sets (E1M2's Haven ~3,300 GU from the start
     # vs BC's ~440), so BC's speed would make a trip to a planet ~20x longer
     # than BC's; 400 keeps the trips near BC's feel. No flash: an intercept
-    # is not a warp.
+    # is not a warp. That scaling applies ONLY inside a mapped system region:
+    # in a BC-scale set (Quick Battle, Deep Space, a mission's own set) the
+    # intercept runs at BC's own 75 (IN_SYSTEM_WARP_SPEED_BC_GUPS), so a
+    # duel's intercept takes distance/75 s as on stbc.exe (stbc-oracle
+    # reference §10).
     IN_SYSTEM_WARP_SPEED_GUPS = 400.0
+    IN_SYSTEM_WARP_SPEED_BC_GUPS = 75.0
     # The ship must be pointing at the target (within ~10°) before the warp
     # engages — BC ships visibly turn onto the warp vector first, and the
     # caller (SDK Intercept.Update) keeps steering via TurnTowardLocation
@@ -937,7 +942,7 @@ class ShipClass(DamageableObject):
         if cos_face < self.IN_SYSTEM_WARP_FACING_COS:
             return 0
         flight = warp_flight.WarpFlight(
-            target=target, speed_policy="ai", exit_policy="keep_pre_warp",
+            target=target, speed_policy="ai", exit_policy="top_impulse",
             drop_distance=float(distance))
         # Warp state first (WES_WARP_INITIATED + a parts hold for a rigged
         # ship, else WES_WARPING), then the ET_IN_SYSTEM_WARP announcement.

@@ -63,11 +63,13 @@ def _fly_orbit(mod, start, max_speed, seconds=240):
 
 # Galaxy cruise (SetMaxSpeed 6.3) from just inside the trigger and from
 # beyond it (Intercept approach first); plus a fast approach from far out.
-@pytest.mark.parametrize("start, max_speed", [(8400.0, 6.3), (12000.0, 6.3),
-                                              (20000.0, 120.0)])
-def test_player_orbit_settles_above_the_atmosphere(orbit_mod, start, max_speed):
+# The far start needs 300 s: its intercept runs at BC's 75 GU/s in this
+# unmapped set (ShipClass.IN_SYSTEM_WARP_SPEED_BC_GUPS), ~200 s from 20000 GU.
+@pytest.mark.parametrize("start, max_speed, seconds", [(8400.0, 6.3, 240), (12000.0, 6.3, 240),
+                                                       (20000.0, 120.0, 300)])
+def test_player_orbit_settles_above_the_atmosphere(orbit_mod, start, max_speed, seconds):
     oa.install(orbit_mod)
-    alts = _fly_orbit(orbit_mod, start, max_speed)
+    alts = _fly_orbit(orbit_mod, start, max_speed, seconds=seconds)
     assert min(alts) > ATMOSPHERE_TOP, "dipped into the atmosphere: %.1f" % min(alts)
     settled = alts[-60:]                    # the last game minute
     assert SETTLED[0] <= min(settled) and max(settled) <= SETTLED[1], \

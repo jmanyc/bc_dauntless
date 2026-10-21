@@ -3,7 +3,7 @@
 Multi-frame transit model: InSystemWarp engages a warp only when the ship is
 beyond the drop distance AND its nose is on the target
 (IN_SYSTEM_WARP_FACING_COS); the ship then cruises toward
-(target − unit_dir · distance) at IN_SYSTEM_WARP_SPEED_GUPS (one fixed speed, as BC),
+(target − unit_dir · distance) at one fixed speed for every ship (BC's 75 GU/s outside a mapped region),
 advanced per tick by warp_flight.step (from ship_motion) — never a same-tick
 teleport. While the transit runs InSystemWarp returns 1 (SDK bWarping);
 on arrival `_warp_consumed` latches (one warp per StopInSystemWarp cycle).
@@ -104,7 +104,8 @@ def test_in_system_warp_transit_arrives_at_radius_edge():
 
 
 def test_in_system_warp_transit_takes_multiple_ticks():
-    """The cruise is finite-speed: every ship flies at the fixed 400 GU/s,
+    """The cruise is finite-speed: every ship flies at the fixed BC 75 GU/s
+    (a set-less ship is not in a mapped region),
     so 705 GU takes several ticks — after one
     tick the ship must NOT yet be at the drop edge, and the mid-transit
     velocity must be published (camera smear / SPEED read it)."""
@@ -118,7 +119,7 @@ def test_in_system_warp_transit_takes_multiple_ticks():
     assert 0.0 < p.y < 705.0
     assert ship.IsDoingInSystemWarp() == 1
     v = ship.GetVelocity()
-    assert v.y == pytest.approx(400.0)
+    assert v.y == pytest.approx(ShipClass.IN_SYSTEM_WARP_SPEED_BC_GUPS)
 
 
 def test_in_system_warp_mid_transit_recall_reports_warping():
@@ -238,7 +239,8 @@ def test_in_system_warp_cruises_at_one_fixed_speed_for_every_ship(authored_max):
     """BC's in-system warp is one fixed speed for every ship: measured 74.95
     GU/s on a Galaxy (MaxSpeed 6.3) and 74.92 on a Kessok Heavy (3.7) in
     stbc-oracle's warp_* captures (bible 7.3). Never scaled by the ship's
-    impulse. Ours is 400 (Mark, 2026-09-28) to suit our larger regions."""
+    impulse. Ours is 75 outside mapped regions (this set-less ship) and 400
+    inside them (Mark, 2026-09-28) to suit our larger regions."""
     ship = ShipClass()
     if authored_max is not None:
         from engine.appc.subsystems import ImpulseEngineSubsystem
@@ -250,4 +252,4 @@ def test_in_system_warp_cruises_at_one_fixed_speed_for_every_ship(authored_max):
     target.SetTranslateXYZ(0.0, 5000.0, 0.0)
     assert ship.InSystemWarp(target, 295.0) == 1
     _step_ship_motion(ship, _DT)
-    assert ship.GetVelocity().y == pytest.approx(400.0)
+    assert ship.GetVelocity().y == pytest.approx(75.0)

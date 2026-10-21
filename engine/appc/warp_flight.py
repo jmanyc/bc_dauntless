@@ -83,7 +83,7 @@ class WarpFlight:
     target: Any = None
     heading: tuple | None = None           # unit, system axes
     speed_policy: str = "ai"               # "ai" | "set_course" | "heading"
-    exit_policy: str = "keep_pre_warp"     # | "rest" | "engaged_impulse"
+    exit_policy: str = "keep_pre_warp"     # | "rest" | "engaged_impulse" | "top_impulse"
     engaged_speed: float = 0.0
     # Heading drop-out standoff from a body's centre (R1). Task 5 supplies the
     # player's region-arrival standoff.
@@ -230,10 +230,20 @@ def _set_local(ship, system_xyz) -> None:
 
 
 def _ai_speed(ship) -> float:
-    """The fixed in-system warp speed, the same for every ship as in BC
-    (ShipClass.IN_SYSTEM_WARP_SPEED_GUPS); ``ship`` is unused."""
+    """The fixed in-system warp speed, the same for every ship as in BC: BC's
+    75 GU/s in an unmapped (BC-scale) set such as Quick Battle; the scaled
+    ShipClass.IN_SYSTEM_WARP_SPEED_GUPS inside a mapped system region, whose
+    distances are several times BC's (see the constant)."""
     from engine.appc.ships import ShipClass
-    return ShipClass.IN_SYSTEM_WARP_SPEED_GUPS
+    try:
+        from engine.systems import region_hooks
+        pSet = frames.containing_set(ship)
+        mapped = pSet is not None and region_hooks.is_mapped(pSet)
+    except Exception:  # noqa: BLE001 - fall back to the scaled speed
+        mapped = True
+    if mapped:
+        return ShipClass.IN_SYSTEM_WARP_SPEED_GUPS
+    return ShipClass.IN_SYSTEM_WARP_SPEED_BC_GUPS
 
 
 def _policy_speed(ship, flight) -> float:
@@ -308,6 +318,12 @@ def _finish(ship, flight, reason, system_xyz, direction) -> None:
     elif flight.exit_policy == "engaged_impulse":
         speed = float(flight.engaged_speed)
         ship._current_speed = speed
+    elif flight.exit_policy == "top_impulse":
+        # An AI intercept drops out at the ship's top impulse speed whatever
+        # it entered at: measured on stbc.exe, a Galaxy leaves at 6.25-6.28
+        # from rest and from impulse 5 alike (stbc-oracle reference §10).
+        speed = _top_impulse_speed(ship)
+        ship._current_speed = speed
     else:                                   # keep_pre_warp
         speed = ship._current_speed
     flight.drop_point = tuple(system_xyz)
@@ -317,6 +333,16 @@ def _finish(ship, flight, reason, system_xyz, direction) -> None:
     if flight.speed_policy == "ai":
         # One warp per StopInSystemWarp cycle (Intercept's contract).
         ship._warp_consumed = True
+
+
+def _top_impulse_speed(ship) -> float:
+    """The ship's live top impulse speed (derated by damage and power); the
+    speed it last had when it has no impulse engines."""
+    ies = ship.GetImpulseEngineSubsystem() if hasattr(ship, "GetImpulseEngineSubsystem") else None
+    try:
+        return max(0.0, float(ies.GetMaxSpeed())) if ies is not None else float(ship._current_speed)
+    except Exception:  # noqa: BLE001
+        return float(ship._current_speed)
 
 
 # ── the tick ──────────────────────────────────────────────────────────────

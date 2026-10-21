@@ -1,4 +1,4 @@
-"""InSystemWarp must not disturb the integrator's _current_speed.
+"""InSystemWarp and the integrator's _current_speed (exit: top impulse speed, measured).
 
 The warp is "instant transit" — semantically the ship crossed a long
 distance, not "the ship came to a halt." The integrator ramps toward the
@@ -18,6 +18,8 @@ The once-per-cycle convergence latch (`_warp_consumed`, set on ARRIVAL in
 the multi-frame transit model) keeps re-calls after the warp from
 re-warping the ship even when the target switches or the boundary drifts.
 """
+import pytest
+
 from engine.appc.ships import ShipClass
 from engine.appc.ship_motion import _step_ship_motion
 from engine.appc.subsystems import ImpulseEngineSubsystem
@@ -43,18 +45,20 @@ def _fly_transit_to_completion(ship, max_ticks=2000):
     raise AssertionError("warp transit never completed")
 
 
-def test_in_system_warp_preserves_current_speed():
-    """The transit changes position, not velocity state. A ship moving at
-    4 GU/s before the warp is still at 4 GU/s after arrival."""
+def test_in_system_warp_exits_at_top_impulse_speed():
+    """An AI intercept drops out at the ship's top impulse speed whatever it
+    entered at: measured on stbc.exe, a Galaxy leaves at 6.25-6.28 from rest
+    and from impulse 5 alike (stbc-oracle reference §10). Replaces the old
+    'pre-warp speed is kept' rule, which the measurement disproved."""
     ship = _make_ship(0.0, 0.0, 0.0)
     target = _make_ship(0.0, 1000.0, 0.0)
     ship._current_speed = 4.0
     warped = ship.InSystemWarp(target, 295.0)
     assert warped == 1, "ship should have engaged — distance 1000 > 295, facing +Y"
     _fly_transit_to_completion(ship)
-    assert ship._current_speed == 4.0, (
-        f"InSystemWarp should not reset _current_speed; got {ship._current_speed}"
-    )
+    top = ship.GetImpulseEngineSubsystem().GetMaxSpeed()
+    assert top > 4.0
+    assert ship._current_speed == pytest.approx(top)
 
 
 def test_in_system_warp_no_op_within_distance():

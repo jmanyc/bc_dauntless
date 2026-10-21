@@ -21,6 +21,17 @@ from engine.appc.ships import ShipClass
 from engine.appc.subsystems import WarpEngineSubsystem
 from engine.core.loop import TICK_DELTA
 
+
+@pytest.fixture(autouse=True)
+def _scaled_warp_speed_everywhere(monkeypatch):
+    """These tests exercise flight GEOMETRY (paths round bodies, drop edges,
+    parts holds) at the scaled region speed they were written for. Their
+    ships sit in unmapped sets, where an intercept now runs at BC's 75 GU/s
+    (IN_SYSTEM_WARP_SPEED_BC_GUPS, its own tests in test_in_system_warp.py),
+    so pin that to the scaled speed here."""
+    from engine.appc.ships import ShipClass as _S
+    monkeypatch.setattr(_S, "IN_SYSTEM_WARP_SPEED_BC_GUPS", _S.IN_SYSTEM_WARP_SPEED_GUPS)
+
 _DT = TICK_DELTA
 _WES = WarpEngineSubsystem
 _WARP_SPEED = ShipClass.IN_SYSTEM_WARP_SPEED_GUPS

@@ -26,6 +26,17 @@ from engine.systems import resolve
 from engine.systems.warp_path import HEADING_DASH_GUPS, Obstacle, clearance_gu
 from tests.helpers.mapped_regions import load_region
 
+
+@pytest.fixture(autouse=True)
+def _scaled_warp_speed_everywhere(monkeypatch):
+    """These tests exercise flight GEOMETRY (paths round bodies, drop edges,
+    parts holds) at the scaled region speed they were written for. Their
+    ships sit in unmapped sets, where an intercept now runs at BC's 75 GU/s
+    (IN_SYSTEM_WARP_SPEED_BC_GUPS, its own tests in test_in_system_warp.py),
+    so pin that to the scaled speed here."""
+    from engine.appc.ships import ShipClass as _S
+    monkeypatch.setattr(_S, "IN_SYSTEM_WARP_SPEED_BC_GUPS", _S.IN_SYSTEM_WARP_SPEED_GUPS)
+
 _DT = 1.0 / 60.0
 
 
@@ -110,7 +121,9 @@ def _old_straight_line(ship_xyz, target_xyz, drop, warp_speed, current_speed):
 
 # ── 1. The existing contract, pinned again through the flight ──────────────
 
-def test_setless_ship_keeps_todays_arrival_speed_and_exit():
+def test_setless_ship_keeps_todays_arrival_point_and_exits_at_top_impulse():
+    """Exit at the ship's top impulse speed, not the pre-warp 3.0 (measured
+    on stbc.exe, stbc-oracle reference §10)."""
     ship = _make_ship()
     ship._current_speed = 3.0
     target = _make_ship((0.0, 1000.0, 0.0), name="target")
@@ -125,7 +138,7 @@ def test_setless_ship_keeps_todays_arrival_speed_and_exit():
     assert _xyz(ship.GetTranslate()) == pytest.approx((0.0, 705.0, 0.0))
     v = ship.GetVelocity()
     assert v.y == pytest.approx(ship._current_speed)
-    assert ship._current_speed == 3.0
+    assert ship._current_speed == pytest.approx(ship.GetImpulseEngineSubsystem().GetMaxSpeed())
     assert ship.IsDoingInSystemWarp() == 0
 
 
@@ -253,8 +266,10 @@ def test_unobstructed_same_set_warp_is_byte_for_byte_the_old_trajectory():
     d = TGPoint3(*(g - s for g, s in zip(goal, start)))
     ship.AlignToVectors(d, TGPoint3(0.0, 0.0, 1.0))
 
+    # Exit speed: the ship's top impulse speed (measured), not the pre-warp 4.2.
     expected, v_end = _old_straight_line(start, goal, 295.0,
-                                         ShipClass.IN_SYSTEM_WARP_SPEED_GUPS, 4.2)
+                                         ShipClass.IN_SYSTEM_WARP_SPEED_GUPS,
+                                         ship.GetImpulseEngineSubsystem().GetMaxSpeed())
     assert ship.InSystemWarp(target, 295.0) == 1
     got = []
     _fly(ship, each=lambda s: got.append(_xyz(s.GetTranslate())))

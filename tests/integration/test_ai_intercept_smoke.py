@@ -15,6 +15,17 @@ from engine.appc.ships import ShipClass
 from engine.appc.subsystems import ImpulseEngineSubsystem
 
 
+@pytest.fixture(autouse=True)
+def _scaled_warp_speed_everywhere(monkeypatch):
+    """These tests exercise flight GEOMETRY (paths round bodies, drop edges,
+    parts holds) at the scaled region speed they were written for. Their
+    ships sit in unmapped sets, where an intercept now runs at BC's 75 GU/s
+    (IN_SYSTEM_WARP_SPEED_BC_GUPS, its own tests in test_in_system_warp.py),
+    so pin that to the scaled speed here."""
+    from engine.appc.ships import ShipClass as _S
+    monkeypatch.setattr(_S, "IN_SYSTEM_WARP_SPEED_BC_GUPS", _S.IN_SYSTEM_WARP_SPEED_GUPS)
+
+
 def _attach_ies(ship, *, max_speed=120.0, max_accel=50.0,
                  max_ang_vel=1.5, max_ang_accel=1.0):
     """Intercept reads MaxSpeed > 0 to enter its prediction-and-control

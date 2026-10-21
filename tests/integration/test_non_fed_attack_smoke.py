@@ -16,6 +16,16 @@ from engine.appc.subsystems import (
 from engine.core.game import Game, Episode, Mission, _set_current_game
 
 
+@pytest.fixture(autouse=True)
+def _scaled_warp_speed_everywhere(monkeypatch):
+    """This test's timing window was sized for the scaled 400 GU/s intercept.
+    Its ships sit in an unmapped set, where an intercept now runs at BC's
+    75 GU/s (IN_SYSTEM_WARP_SPEED_BC_GUPS, tested in test_in_system_warp.py),
+    so pin that to the scaled speed here."""
+    from engine.appc.ships import ShipClass as _S
+    monkeypatch.setattr(_S, "IN_SYSTEM_WARP_SPEED_BC_GUPS", _S.IN_SYSTEM_WARP_SPEED_GUPS)
+
+
 @pytest.fixture
 def game_context():
     """Mission stack with a non-empty script for sMissionModuleName."""
