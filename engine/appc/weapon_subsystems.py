@@ -160,6 +160,44 @@ def _emitter_world_direction(emitter, ship) -> TGPoint3:
     return world
 
 
+def _rough_direction(weapon, yaw, pitch):
+    """WORLD direction of the weapon's forward turned by `yaw` toward right
+    (forward x up) and lifted by `pitch` toward up (Weapon.CalculateRoughDirection
+    for energy weapons; see PhaserBank.CalculateRoughDirection)."""
+    f = weapon.GetOrientationForward()
+    u = weapon.GetOrientationUp()
+    if not isinstance(f, TGPoint3) or not isinstance(u, TGPoint3):
+        return _emitter_world_direction(weapon, weapon._climb_to_ship())
+    rx, ry, rz = f.y * u.z - f.z * u.y, f.z * u.x - f.x * u.z, f.x * u.y - f.y * u.x
+    cy, sy, cp, sp = _math.cos(yaw), _math.sin(yaw), _math.cos(pitch), _math.sin(pitch)
+    d = TGPoint3(cp * (cy * f.x + sy * rx) + sp * u.x,
+                 cp * (cy * f.y + sy * ry) + sp * u.y,
+                 cp * (cy * f.z + sy * rz) + sp * u.z)
+    ship = weapon._climb_to_ship()
+    if ship is not None and hasattr(ship, "GetWorldRotation"):
+        rot = ship.GetWorldRotation()
+        if isinstance(rot, TGMatrix3):
+            d.MultMatrixLeft(rot)
+    return d
+
+
+def _low_half_rough_direction(weapon):
+    """Pulse cannons and tractor projectors: measured on the original, their
+    rough direction is turned, on each axis, by the arc's middle PLUS half its
+    low end -- min/2 + (min + max)/2, not the middle a phaser bank uses. A
+    symmetric +-20 deg cannon lands at (-10, -10) deg, port and starboard
+    alike; a Galaxy's forward tractor (width +-60, height -5..+70) at
+    (-30, +30); its second (height +5..-70) at (-30, -67.5) (stbc-oracle
+    results_mac/rough_*.json, every pulse weapon and tractor of the measured
+    classes). Without it these emitters fell through to a zero vector, which
+    IntelligentCircleObject counted as a weapon at 90 degrees."""
+    def _angle(a, b):
+        lo, hi = min(float(a), float(b)), max(float(a), float(b))
+        return 0.5 * lo + 0.5 * (lo + hi)
+    return _rough_direction(weapon, _angle(weapon._arc_width_lo, weapon._arc_width_hi),
+                            _angle(weapon._arc_height_lo, weapon._arc_height_hi))
+
+
 def _emitter_in_arc(emitter, ship, aim_world):
     """Returns True if `aim_world` (unit vector) lies inside the emitter's
     firing arc, rotated into world space via the ship's rotation.
@@ -231,13 +269,30 @@ def _emitter_in_arc(emitter, ship, aim_world):
     yaw   = _math.atan2(right_dot, fwd_dot)
     pitch = _math.asin(max(-1.0, min(1.0, up_dot)))
 
-    yaw_lo, yaw_hi = arc_w
+    # An arc is the range between its two angles in EITHER order: the Akira's
+    # ventral banks author theirs descending (SetArcHeightAngles(-0.349066,
+    # -1.570796), SetArcWidthAngles(0.0, -1.221731)) and the original fires them
+    # across -90..-20 deg elevation, 70 deg wide (stbc-oracle
+    # arcs150_akira_nebula, PhaserBank.CanHit). Read in authored order, those
+    # four banks could never fire: Akira phaser hits fell to 7.5/min vs 64.
+    yaw_lo, yaw_hi = min(arc_w), max(arc_w)
     arc_h = emitter.GetArcHeightAngles() if hasattr(emitter, "GetArcHeightAngles") else None
     if not (isinstance(arc_h, tuple) and len(arc_h) == 2):
         # Arc width set but height missing — allow any pitch.
         return yaw_lo <= yaw <= yaw_hi
-    pitch_lo, pitch_hi = arc_h
-    return (yaw_lo <= yaw <= yaw_hi) and (pitch_lo <= pitch <= pitch_hi)
+    pitch_lo, pitch_hi = min(arc_h), max(arc_h)
+    if (yaw_lo <= yaw <= yaw_hi) and (pitch_lo <= pitch <= pitch_hi):
+        return True
+    # A height arc may run past the vertical (Kessok/Cardassian dorsal beams:
+    # 0.87..2.79 rad; Marauder's ventral -2.79..0.02): the same direction is
+    # also (yaw + pi, pi - pitch) "over the top", and the original fires there
+    # -- KessokHeavy Dorsal Beam 1 hits behind and above at azimuth 135-230,
+    # elevation 20-80 (stbc-oracle arcs150_kessokheavy_marauder; 89.8% -> 100%).
+    if pitch_hi <= _math.pi / 2 and pitch_lo >= -_math.pi / 2:
+        return False
+    back = yaw - _math.pi if yaw > 0.0 else yaw + _math.pi
+    over = _math.pi - pitch if pitch >= 0.0 else -_math.pi - pitch
+    return (yaw_lo <= back <= yaw_hi) and (pitch_lo <= over <= pitch_hi)
 
 
 # ── Discharge sources (RE'd from stbc.exe 2026-09-14; experiment doc
@@ -2467,6 +2522,65 @@ class PhaserBank(_EnergyWeaponFireMixin, WeaponSystem):
         elif v > self._max_charge: self._charge_level = self._max_charge
         else:                      self._charge_level = v
 
+    def GetPositionTG(self) -> TGPoint3:
+        """The bank's runtime position: the MIDPOINT OF ITS FIRING ARC on its
+        phaser strip, not the hardpoint position.
+
+        A bank is an arc of an ellipse centred on the hardpoint position:
+        Length along the bank's forward axis, Width along right = forward x
+        up. stbc.exe's ShipSubsystem.GetPosition returns the point at the
+        middle of the bank's arc-width range:
+
+            pos + fwd * Length * cos(mid) + right * Width * sin(mid),
+            mid = (ArcWidthMin + ArcWidthMax) / 2
+
+        Measured (stbc-oracle results_mac/hittable_r20_57_150.json, `cr`
+        rows): the Galaxy's four ventral banks all have hardpoint position
+        (0, 1.3, 0.16) but sit at (-1.33, 1.3), (-0.665, 2.175), (0.665,
+        2.175), (1.33, 1.3) -- the formula reproduces every bank on both
+        ships. With the hardpoint position all four were stacked on one
+        point: the AI aimed every bank's shots at the same spot, and a hit
+        there damaged all four at once."""
+        base = super().GetPositionTG()
+        L = float(getattr(self, "_length", 0.0) or 0.0)
+        W = float(getattr(self, "_width", 0.0) or 0.0)
+        if L == 0.0 and W == 0.0:
+            return base
+        f = self.GetOrientationForward()
+        u = self.GetOrientationUp()
+        if not isinstance(f, TGPoint3) or not isinstance(u, TGPoint3):
+            return base
+        rx = f.y * u.z - f.z * u.y
+        ry = f.z * u.x - f.x * u.z
+        rz = f.x * u.y - f.y * u.x
+        mid = 0.5 * (float(self._arc_width_lo) + float(self._arc_width_hi))
+        c, s_ = _math.cos(mid), _math.sin(mid)
+        return TGPoint3(base.x + f.x * L * c + rx * W * s_,
+                        base.y + f.y * L * c + ry * W * s_,
+                        base.z + f.z * L * c + rz * W * s_)
+
+    def CalculateRoughDirection(self) -> TGPoint3:
+        """WORLD-space centre of this bank's firing arc: the bank's forward
+        turned by the middle of its width arc (toward right = forward x up)
+        and lifted by the middle of its height arc (toward up).
+
+        Measured on the original (stbc-oracle results_mac/rough_*.json,
+        Weapon.CalculateRoughDirection in the model frame): a Galaxy's Dorsal
+        Phaser 2 (forward +Y, width -80..+20 deg, height -3..+60 deg) gives
+        (-0.439, 0.761, 0.477) -- 30 deg to port, 28.5 deg up -- exactly this
+        formula, on every phaser bank of the measured classes. PhaserSweep turns
+        this direction onto its target and IntelligentCircleObject weighs
+        weapons by it; with the mount forward instead, a sweeping Federation
+        ship pointed its nose at the enemy (target in the 30 deg nose cone
+        40-66% of a sweep vs the original's 18-20%) and stayed out of the
+        enemy's dorsal and ventral arcs.
+
+        Not the arc FRAME: _emitter_in_arc still measures yaw and pitch from
+        the mount forward/up."""
+        yaw = 0.5 * (float(self._arc_width_lo) + float(self._arc_width_hi))
+        pitch = 0.5 * (float(self._arc_height_lo) + float(self._arc_height_hi))
+        return _rough_direction(self, yaw, pitch)
+
     def CanHit(self, target_world_point) -> int:
         """1 if `target_world_point` lies inside this bank's firing arc and
         within its maximum range, else 0.
@@ -2488,7 +2602,7 @@ class PhaserBank(_EnergyWeaponFireMixin, WeaponSystem):
         if not isinstance(target_world_point, TGPoint3):
             return 0
         ship = self.GetParentShip()
-        origin = subsystem_world_position(self, ship)
+        origin = subsystem_world_position(self, ship, mount=True)   # arc origin = strip centre
         if origin is None:
             return 0
 
@@ -2499,16 +2613,12 @@ class PhaserBank(_EnergyWeaponFireMixin, WeaponSystem):
         if dist <= 0.0:
             return 0
 
-        max_range = 0.0
-        prop = self.GetProperty() if hasattr(self, "GetProperty") else None
-        if prop is not None and hasattr(prop, "GetMaxDamageDistance"):
-            try:
-                max_range = float(prop.GetMaxDamageDistance())
-            except Exception:
-                max_range = 0.0
-        if max_range > 0.0 and dist > max_range:
-            return 0
-
+        # No MaxDamageDistance cutoff: on stbc.exe PhaserBank.CanHit answers the
+        # same at 150 GU as at 50 GU (the full arc map), and banks fire well past
+        # MaxDamageDistance with damage x R/dist (stbc-oracle reference §1.5;
+        # the AI fires 52-64% of the time beyond 150 GU). MaxDamageDistance is a
+        # damage falloff, not a reach. A cutoff here stopped the AI firing
+        # beyond 60-70 GU.
         aim = TGPoint3(dx / dist, dy / dist, dz / dist)
         return 1 if _emitter_in_arc(self, ship, aim) else 0
 
@@ -2534,6 +2644,9 @@ class PulseWeapon(_EnergyWeaponFireMixin, WeaponSystem):
         # so the condition's MinFiringCharge/MaxCharge threshold lines up.
         self._charge_watcher = FloatRangeWatcher()
 
+
+    def CalculateRoughDirection(self) -> TGPoint3:
+        return _low_half_rough_direction(self)
     def GetMaxCharge(self) -> float:                return self._max_charge
     def GetMinFiringCharge(self) -> float:          return self._min_firing_charge
     def GetNormalDischargeRate(self) -> float:      return self._normal_discharge_rate
@@ -2707,6 +2820,9 @@ class TractorBeam(_EnergyWeaponFireMixin, WeaponSystem):
         self._target = None
         self._target_offset = None
 
+
+    def CalculateRoughDirection(self) -> TGPoint3:
+        return _low_half_rough_direction(self)
     def GetMaxCharge(self) -> float:                return self._max_charge
     def GetMinFiringCharge(self) -> float:          return self._min_firing_charge
     def GetNormalDischargeRate(self) -> float:      return self._normal_discharge_rate

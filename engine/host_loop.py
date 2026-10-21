@@ -7599,7 +7599,10 @@ class _MissionLoader:
 
     def _realize_session(self, sess: MissionSession) -> MissionSession:
         import App
+        from engine.appc import hull_line_of_sight
         r_ = self._c.renderer
+        # IsHittableFromLocation traces the hull mesh of these instances.
+        hull_line_of_sight.set_ship_instances(sess.ship_instances)
 
         for ship in _iter_active_ships(verbose=self._verbose):
             _override = _rock_model_override(ship)

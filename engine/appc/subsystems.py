@@ -23,7 +23,7 @@ import engine.dev_mode as dev_mode
 from engine.appc import ship_death as _ship_death
 
 
-def subsystem_world_position(sub, ship=None):
+def subsystem_world_position(sub, ship=None, mount=False, damage=False):
     """World mount point of a subsystem: ship_loc + R · local_mount.
 
     Column-vector rotation convention (R · v); NO scale — BC stores mounts
@@ -32,13 +32,29 @@ def subsystem_world_position(sub, ship=None):
 
     ``ship`` may be passed explicitly (required for the Hull/root subsystem,
     whose ``_climb_to_ship()`` returns None).
+
+    ``mount=True`` uses the hardpoint MOUNT position instead of the runtime
+    GetPosition: they differ only for phaser banks, whose runtime position
+    is the middle of their firing arc on the strip (PhaserBank.GetPositionTG)
+    while the strip ellipse, emit point and arc origin are centred on the
+    mount.
+
+    ``damage=True`` uses the subsystem's DAMAGE point (GetDamagePoint): the
+    centre a hit's footprint is measured from. It differs from the position
+    only for energy weapons placed outside the hull
+    (engine/appc/hull_line_of_sight.py).
     """
     if ship is None:
         ship = sub._climb_to_ship() if hasattr(sub, "_climb_to_ship") else None
     if ship is None or not hasattr(ship, "GetWorldLocation"):
         return TGPoint3(0.0, 0.0, 0.0)
     ship_pos = ship.GetWorldLocation()
-    local = sub.GetPosition() if hasattr(sub, "GetPosition") else None
+    if mount and hasattr(sub, "GetMountPositionTG"):
+        local = sub.GetMountPositionTG()
+    elif damage and hasattr(sub, "GetDamagePoint"):
+        local = sub.GetDamagePoint()
+    else:
+        local = sub.GetPosition() if hasattr(sub, "GetPosition") else None
     if not isinstance(local, TGPoint3):
         return TGPoint3(ship_pos.x, ship_pos.y, ship_pos.z)
     # Follow the part this mount sits on, BEFORE rotating into world space:
@@ -768,6 +784,11 @@ class ShipSubsystem(TGEventHandlerObject):
     def GetPositionTG(self) -> TGPoint3:
         return TGPoint3(self._position.x, self._position.y, self._position.z)
 
+    def GetMountPositionTG(self) -> TGPoint3:
+        """The hardpoint (property) position; equals GetPositionTG except
+        for phaser banks (see PhaserBank.GetPositionTG)."""
+        return TGPoint3(self._position.x, self._position.y, self._position.z)
+
     def GetPosition(self) -> TGPoint3:
         return self.GetPositionTG()
 
@@ -870,7 +891,22 @@ class ShipSubsystem(TGEventHandlerObject):
         return self.GetPositionTG()
 
     def GetDamagePoint(self) -> TGPoint3:
-        return self.GetPositionTG()
+        """The original's damage point: the position, or -- when that lies
+        outside the hull (a bank's strip midpoint, a tube on the skin) -- the
+        first hull entry walking toward the ship's centre, 0.05 GU deeper
+        (engine/appc/hull_line_of_sight.py, measured on ten ship classes).
+        Model frame. The position when no hull geometry is known."""
+        from engine.appc import hull_line_of_sight
+        ship = self._climb_to_ship() if hasattr(self, "_climb_to_ship") else None
+        if ship is None:
+            ship = getattr(self, "_parent_ship", None)
+        try:
+            dp = hull_line_of_sight.damage_point_local(self, ship)
+        except Exception:  # noqa: BLE001 - no geometry: the position, as before
+            dp = None
+        if dp is None:
+            return self.GetPositionTG()
+        return TGPoint3(dp[0], dp[1], dp[2])
 
     def _climb_to_ship(self):
         """Walk parent-subsystem chain until a ShipClass is found.  Used
@@ -896,7 +932,7 @@ class ShipSubsystem(TGEventHandlerObject):
     def _emitter_world_position(self) -> TGPoint3:
         """World position of this emitter mount: ship_loc + R · local.
         Delegates to the module-level subsystem_world_position helper."""
-        return subsystem_world_position(self)
+        return subsystem_world_position(self, mount=True)
 
     def _strip_emit_position(self, target_world) -> TGPoint3:
         """Closest point on a phaser-strip arc to ``target_world``.
@@ -964,6 +1000,8 @@ class ShipSubsystem(TGEventHandlerObject):
             yaw = _math.atan2(right_proj, fwd_proj)
         yaw_lo = getattr(self, "_arc_width_lo", -_math.pi)
         yaw_hi = getattr(self, "_arc_width_hi",  _math.pi)
+        if yaw_lo > yaw_hi:                      # authored descending (Akira ventral banks)
+            yaw_lo, yaw_hi = yaw_hi, yaw_lo
         yaw = max(yaw_lo, min(yaw_hi, yaw))
 
         # Rotate world_forward toward world_right by yaw, in their (orthonormal)
@@ -1161,12 +1199,14 @@ class ShipSubsystem(TGEventHandlerObject):
 
     def IsHittableFromLocation(self, vWorldLoc) -> float:
         """SDK Preprocessors.py:980 — `fHittable = pSubsystem.IsHittableFromLocation(pOurShip.GetWorldLocation())`.
-        Native Appc returns a scalar (0.0..1.0) reflecting LOS / occlusion
-        from the firing ship's location to the subsystem position. Phase 1
-        treats every subsystem as fully hittable (no occlusion model);
-        real geometry support lands when the renderer carries collision
-        meshes."""
-        return 1.0
+        Measured 0/1 line of sight through the hull mesh to this
+        subsystem's position (engine/appc/hull_line_of_sight.py has the
+        rule and its measurement). 1.0 with no renderer instance."""
+        from engine.appc import hull_line_of_sight
+        ship = self._climb_to_ship() if hasattr(self, "_climb_to_ship") else None
+        if ship is None:
+            ship = getattr(self, "_parent_ship", None)
+        return hull_line_of_sight.hittable_from(self, ship, vWorldLoc)
 
 
 # BC draw modes (ship-subsystems.md:164-189).  Per-class assignment below.

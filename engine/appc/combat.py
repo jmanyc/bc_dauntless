@@ -171,7 +171,7 @@ def _body_frame_delta(ship, hit_point):
     )
 
 
-def _subsystem_world_position(ship, subsystem):
+def _subsystem_world_position(ship, subsystem, damage=False):
     """Return the world-space position of `subsystem` on `ship` -- the
     splash catchment centre.
 
@@ -183,7 +183,7 @@ def _subsystem_world_position(ship, subsystem):
     hull, so a direct hit on the drawn gun reached nothing.
     """
     from engine.appc.subsystems import subsystem_world_position
-    return subsystem_world_position(subsystem, ship)
+    return subsystem_world_position(subsystem, ship, damage=damage)
 
 
 def _splash_weight(r_sub: float, r_hit: float, d: float) -> float:
