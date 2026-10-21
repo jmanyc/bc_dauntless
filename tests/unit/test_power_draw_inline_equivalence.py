@@ -123,7 +123,7 @@ def test_pump_consumers_still_uses_the_fast_field_for_plain_consumers():
     b.SetNormalPowerPerSecond(50.0);  b.TurnOn()
     p.GetParentShip = lambda: _Ship([a, b])
 
-    p._pump_consumers(1.0 / 60.0)
+    p._pump_consumers(PowerSubsystem.HANDOUT_PERIOD)   # one BC hand-out (3 per second)
 
     assert p.GetPowerWanted() == a._power_wanted + b._power_wanted
     assert p.GetPowerWanted() > 0.0

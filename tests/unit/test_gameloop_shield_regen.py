@@ -1,4 +1,5 @@
 """GameLoop.tick drives shield regen on registered ships."""
+from engine.appc.subsystems import SHIELD_REGEN_EFFICIENCY as E  # measured: authored rate x 0.843 (stbc-oracle reference §2.4)
 import App
 from engine.appc.properties import ShieldProperty
 from engine.appc.sets import SetClass
@@ -35,10 +36,10 @@ def test_tick_regens_shields_on_set_managed_ship():
     assert shields.GetCurrentShields(ShieldProperty.FRONT_SHIELDS) == 0.0
 
     # Crossing the threshold charges for the WHOLE accumulated interval at the
-    # authored rate, so the step is ~0.5 s x 60/s = ~30.
+    # measured rate (authored x E), so the step is ~0.5 s x 60/s x E.
     loop.advance(TICK_RATE // 4 + 1)      # ~0.52 s total
     after_first = shields.GetCurrentShields(ShieldProperty.FRONT_SHIELDS)
-    assert 29.0 <= after_first <= 32.0, after_first
+    assert 29.0 * E <= after_first <= 32.0 * E, after_first
 
     # BC RESETS the accumulator on a crossing rather than subtracting the
     # period (section 6.1 step 3), so applied time trails elapsed time by up to
@@ -49,7 +50,7 @@ def test_tick_regens_shields_on_set_managed_ship():
     elapsed_ticks = TICK_RATE // 2 + 1
     loop.advance((TICK_RATE * 3) // 2 - elapsed_ticks)
     total = shields.GetCurrentShields(ShieldProperty.FRONT_SHIELDS)
-    assert 60.0 * (1.5 - 0.5) <= total <= 60.0 * 1.5, total
+    assert 60.0 * E * (1.5 - 0.5) <= total <= 60.0 * E * 1.5, total
     assert total < 100.0, "clamped at max; widen the headroom, not the band"
 
 

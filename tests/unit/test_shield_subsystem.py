@@ -1,5 +1,6 @@
-import pytest
 """ShieldSubsystem: six-face shield slots with seed-on-max behavior."""
+import pytest
+from engine.appc.subsystems import SHIELD_REGEN_EFFICIENCY as E  # measured: authored rate x 0.843 (stbc-oracle reference §2.4)
 from engine.appc.subsystems import ShieldSubsystem, PoweredSubsystem
 from engine.appc.properties import ShieldProperty
 
@@ -99,7 +100,7 @@ def test_update_regenerates_face():
     s.SetCurShields(ShieldProperty.FRONT_SHIELDS, 50.0)
     s.SetShieldChargePerSecond(ShieldProperty.FRONT_SHIELDS, 10.0)
     s.Update(1.0)
-    assert s.GetCurrentShields(ShieldProperty.FRONT_SHIELDS) == 60.0
+    assert s.GetCurrentShields(ShieldProperty.FRONT_SHIELDS) == pytest.approx(50.0 + 10.0 * E)
 
 
 def test_update_clamps_at_max():
@@ -145,7 +146,7 @@ def test_update_powered_down_still_regenerates():
     s.SetCurShields(ShieldProperty.FRONT_SHIELDS, 50.0)
     s.SetShieldChargePerSecond(ShieldProperty.FRONT_SHIELDS, 10.0)
     s.Update(1.0)
-    assert s.GetCurrentShields(ShieldProperty.FRONT_SHIELDS) == 60.0
+    assert s.GetCurrentShields(ShieldProperty.FRONT_SHIELDS) == pytest.approx(50.0 + 10.0 * E)
 
 
 def test_update_independent_per_face():
@@ -158,8 +159,8 @@ def test_update_independent_per_face():
     s.SetShieldChargePerSecond(ShieldProperty.FRONT_SHIELDS, 10.0)
     s.SetShieldChargePerSecond(ShieldProperty.REAR_SHIELDS, 20.0)
     s.Update(2.0)
-    assert s.GetCurrentShields(ShieldProperty.FRONT_SHIELDS) == 20.0
-    assert s.GetCurrentShields(ShieldProperty.REAR_SHIELDS) == 40.0
+    assert s.GetCurrentShields(ShieldProperty.FRONT_SHIELDS) == pytest.approx(20.0 * E)
+    assert s.GetCurrentShields(ShieldProperty.REAR_SHIELDS) == pytest.approx(40.0 * E)
 
 
 def test_apply_damage_partial():

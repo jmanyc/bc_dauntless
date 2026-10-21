@@ -10,6 +10,8 @@ checks them), so Dauntless authors them here:
   * the hull stays physically present — a collision still fires
     ET_CLOAKED_COLLISION.
 """
+import pytest
+from engine.appc.subsystems import SHIELD_REGEN_EFFICIENCY as E  # measured: authored rate x 0.843 (stbc-oracle reference §2.4)
 import App
 
 from engine.appc.ships import ShipClass, ShipClass_Create
@@ -152,7 +154,7 @@ def test_shields_recharge_while_cloaked():
     ship.GetCloakingSubsystem().InstantCloak()          # fully cloaked
     shields.Update(1.0)                                  # 100/s * 1s
     for f in range(ShieldSubsystem.NUM_SHIELDS):
-        assert shields.GetCurrentShields(f) == 600.0     # recharged, not suppressed
+        assert shields.GetCurrentShields(f) == pytest.approx(500.0 + 100.0 * E)  # recharged, not suppressed
 
 
 def test_shields_recharge_while_cloaked_even_if_not_up():
@@ -166,7 +168,7 @@ def test_shields_recharge_while_cloaked_even_if_not_up():
     ship.GetCloakingSubsystem().InstantCloak()
     shields.Update(1.0)
     for f in range(ShieldSubsystem.NUM_SHIELDS):
-        assert shields.GetCurrentShields(f) == 300.0     # recharged despite IsOn False
+        assert shields.GetCurrentShields(f) == pytest.approx(200.0 + 100.0 * E)  # recharged despite IsOn False
 
 
 def test_shields_drop_and_do_not_recharge_when_generator_offline():

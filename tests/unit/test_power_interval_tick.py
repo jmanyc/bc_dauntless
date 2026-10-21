@@ -12,6 +12,8 @@ remainder (elapsed - POWER_INTERVAL) carries forward as the starting value.
 All expected values in these tests are derived from the same accumulated-sum
 arithmetic that the implementation uses, not from multiplication.
 """
+import pytest
+
 from engine.appc.subsystems import PowerSubsystem
 from engine.appc.properties import PowerProperty
 
@@ -114,16 +116,30 @@ def test_no_recharge_while_reactor_offline():
     assert ps.GetMainBatteryPower() == 0.0
 
 
-def test_no_recharge_while_reactor_disabled():
-    """IsDisabled() == 1 (condition at/below DisabledPercentage threshold)."""
+def test_disabled_reactor_still_recharges_at_output_times_condition():
+    """A DISABLED core keeps generating PowerOutput x condition. Measured on
+    stbc.exe (stbc-oracle power_core / M20): a Galaxy core at 49%, below its
+    50% threshold, charged the main battery at +490/s. Only a destroyed core
+    (or radiation outage / ship out of action) stops output."""
     ps = PowerSubsystem("Warp Core")
     _bind(ps, main=1000.0, backup=5000.0)
     ps.SetMainBatteryPower(0.0)
     ps.SetBackupBatteryPower(0.0)
-    # Use a high disabled threshold: disabled when condition <= 50% of max
     ps.SetMaxCondition(100.0)
-    ps.SetDisabledPercentage(0.5)   # disabled when condition <= 50
-    ps.SetCondition(30.0)           # 30 <= 50 → IsDisabled() == 1
+    ps.SetDisabledPercentage(0.5)   # disabled below 50
+    ps.SetCondition(30.0)           # disabled
+    assert ps.IsDisabled() == 1
+    _run_seconds(ps, 2.0)
+    assert ps.GetMainBatteryPower() == pytest.approx(1000.0 * 0.3 * 2.0)
+
+
+def test_no_recharge_while_reactor_destroyed():
+    ps = PowerSubsystem("Warp Core")
+    _bind(ps, main=1000.0, backup=5000.0)
+    ps.SetMainBatteryPower(0.0)
+    ps.SetBackupBatteryPower(0.0)
+    ps.SetMaxCondition(100.0)
+    ps.SetCondition(0.0)
     _run_seconds(ps, 2.0)
     assert ps.GetMainBatteryPower() == 0.0
 

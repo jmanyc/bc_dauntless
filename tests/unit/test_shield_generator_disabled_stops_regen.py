@@ -3,6 +3,7 @@ regenerates nothing, without mutating _charge_per_second. Repair restores
 regen at the original rates, refilling from zero. Measured on the original
 exe (stbc-oracle bible §5.3 S6, `regen_gen{50,20}_face50`): below the
 generator's DisabledPercentage all six faces read 0 immediately."""
+from engine.appc.subsystems import SHIELD_REGEN_EFFICIENCY as E  # measured: authored rate x 0.843 (stbc-oracle reference §2.4)
 import pytest
 
 from engine.appc.subsystems import ShieldSubsystem
@@ -31,8 +32,8 @@ def _generator(condition=100.0, max_condition=100.0, disabled_percentage=0.75):
 def test_healthy_generator_regens():
     s = _generator()
     s.Update(dt=1.0)
-    # 500 + 50*1 = 550, clamped to 1000 max
-    assert s.GetCurrentShields(s.FRONT_SHIELDS) == 550.0
+    # 500 + 50*E*1, clamped to 1000 max
+    assert s.GetCurrentShields(s.FRONT_SHIELDS) == pytest.approx(500.0 + 50.0 * E)
 
 
 def test_disabled_generator_drops_every_face_and_skips_regen():
@@ -64,7 +65,7 @@ def test_disabled_generator_preserves_charge_per_second():
     s.SetCondition(100.0)
     assert s.IsDisabled() == 0
     s.Update(dt=1.0)
-    assert s.GetCurrentShields(s.FRONT_SHIELDS) == 50.0
+    assert s.GetCurrentShields(s.FRONT_SHIELDS) == pytest.approx(50.0 * E)
 
 
 def test_disabled_generator_still_takes_damage():

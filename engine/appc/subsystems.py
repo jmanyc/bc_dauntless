@@ -158,9 +158,13 @@ def impulse_online_fraction(ies) -> float:
 # verified observation. It is adopted because it also matches the 0.5 s beam
 # damage pulse the same document describes.
 SHIELD_CHARGE_PERIOD_S = 0.5
+# Fraction of the authored ShieldChargePerSecond the original delivers at 100%
+# Shields power: Sovereign 10.10/12 = 0.842, Galaxy faces 9.25-9.29/11 = 0.841-0.845
+# (stbc-oracle regen_faces / regen_faces_sovereign). Why 0.84 is not known.
+SHIELD_REGEN_EFFICIENCY = 0.843
 
 
-def impulse_output_fraction(ies) -> float:
+def impulse_output_fraction(ies, ignore_handout: bool = False) -> float:
     """The scalar BC multiplies an impulse engine's authored limits by.
 
     Decompiled from stbc.exe's ImpulseEngineSubsystem::GetMaxSpeed
@@ -214,6 +218,13 @@ def impulse_output_fraction(ies) -> float:
                 contrib += pod.GetConditionPercentage()
         cur = contrib / n
     cur = max(0.0, min(1.0, cur))
+    # The power term is the engines' received share: the slider while they
+    # are fed, 0 for a hand-out they missed -- the ship then coasts (measured:
+    # acceleration drops to exactly 0 for one 0.33 s hand-out and resumes,
+    # stbc-oracle impulse_matrix shot 68; core 30% averages 5.71 of 6.3,
+    # PW3). Before the first hand-out (or with no power plant) the slider.
+    if not ignore_handout and getattr(ies, "_handout_fed", None) is False:
+        return 0.0
     return cur * ies.GetPowerPercentageWanted()
 
 
@@ -1188,6 +1199,14 @@ class PoweredSubsystem(ShipSubsystem):
     # scaled by _power_percentage_wanted. Only TractorBeamSystem sets this True;
     # every conduit-routed consumer leaves it False and uses power._draw().
     DRAWS_DIRECT_FROM_MAIN = False
+    # True on energy weapons: they take their power share every frame instead
+    # of at the 3-per-second hand-outs (PowerSubsystem._pump_consumers).
+    # Declared here, never read with a getattr default: TGObject.__getattr__
+    # answers an undeclared public name with a truthy _Stub.
+    POWER_EVERY_FRAME = False
+    # True on the shields and impulse engines: served together in the later
+    # of the two hand-outs (PowerSubsystem._pump_consumers).
+    POWER_HANDOUT_LATE = False
 
     def __init__(self, name: str = ""):
         super().__init__(name)
@@ -1308,6 +1327,44 @@ class PoweredSubsystem(ShipSubsystem):
         self._efficiency = received / wanted if wanted > 0.0 else 1.0
         self._power_factor = received / base
 
+    def _handout_demand(self, period: float) -> float:
+        """This consumer's demand for one hand-out period (0 when it wants none)."""
+        if not self._wants_power():
+            return 0.0
+        return max(0.0, self._normal_power * float(period) * self._power_percentage_wanted)
+
+    def _apply_handout(self, period: float, wanted: float, power) -> None:
+        """One BC power hand-out: the whole demand if the budget covers it,
+        else nothing (stbc-oracle reference §6.4). The fed / starved state
+        holds until the next hand-out. Fields as _update_power; wanted /
+        received are amounts for this hand-out period."""
+        period = float(period)
+        if period <= 0.0:
+            return
+        if not self._wants_power():
+            self._power_wanted = 0.0
+            self._power_received = 0.0
+            self._efficiency = 0.0
+            self._power_factor = 0.0
+            self._handout_fed = False
+            return
+        base = self._normal_power * period
+        if base <= 0.0:
+            self._power_wanted = 0.0
+            self._power_received = 0.0
+            self._efficiency = 1.0
+            self._power_factor = 1.0
+            self._handout_fed = True
+            return
+        # power None: starved by the hand-out it belongs to (see _pump_consumers)
+        fed = power is not None and (wanted <= 0.0 or power._can_draw(wanted, self.POWER_MODE))
+        received = power._draw(wanted, self.POWER_MODE) if (fed and wanted > 0.0) else 0.0
+        self._power_wanted = wanted
+        self._power_received = received
+        self._efficiency = received / wanted if wanted > 0.0 else 1.0
+        self._power_factor = received / base
+        self._handout_fed = bool(fed)
+
     # ── Subsystem event emission ─────────────────────────────────────────────
 
     def _fire(self, event_attr: str) -> None:
@@ -1335,6 +1392,7 @@ class PoweredSubsystem(ShipSubsystem):
 # as a raw `_power_wanted` read. Anything that overrides GetPowerWanted (as
 # PowerSubsystem itself does) fails the identity test there and gets called.
 _BASE_GET_POWER_WANTED = PoweredSubsystem.GetPowerWanted
+_BASE_UPDATE_POWER = PoweredSubsystem._update_power
 
 
 class HullSubsystem(ShipSubsystem):
@@ -1579,6 +1637,7 @@ class SensorSubsystem(PoweredSubsystem):
 class ImpulseEngineSubsystem(PoweredSubsystem):
     """Live impulse-engine state.  Speed/accel limits come from the
     matching ImpulseEngineProperty template via ShipClass.SetupProperties()."""
+    POWER_HANDOUT_LATE = True   # served with the other late-group system (PowerSubsystem._pump_consumers)
 
     def __init__(self, name: str = ""):
         super().__init__(name)
@@ -1765,6 +1824,7 @@ class ShieldSubsystem(PoweredSubsystem):
     SetMaxShields seeds current to that max when current was 0 — mirrors
     HullSubsystem.SetMaxCondition so freshly-loaded ships start fully shielded.
     """
+    POWER_HANDOUT_LATE = True   # served with the other late-group system (PowerSubsystem._pump_consumers)
     FRONT_SHIELDS  = 0
     REAR_SHIELDS   = 1
     TOP_SHIELDS    = 2
@@ -2043,11 +2103,16 @@ class ShieldSubsystem(PoweredSubsystem):
         # charge keeps regenerating — the cloak case was a 2026-07-08 live
         # fix, the green case is the S5 capture above; they are the same rule.
         dt = float(dt)
+        # Measured on stbc.exe (stbc-oracle reference §2.4): each face regains
+        # SHIELD_REGEN_EFFICIENCY x the authored ShieldChargePerSecond x the
+        # Shields power fraction -- Galaxy 11 -> 9.26/s, Sovereign 12 -> 10.10/s
+        # at 100%, linear in the Shields control (0 at 0%, 4.72 at 50%).
+        rate_scale = SHIELD_REGEN_EFFICIENCY * self._regen_power_factor()
         for f in range(self.NUM_SHIELDS):
             mx = self._max_shields[f]
             if mx == 0.0:
                 continue
-            new = self._current_shields[f] + self._charge_per_second[f] * dt
+            new = self._current_shields[f] + self._charge_per_second[f] * rate_scale * dt
             if new > mx:
                 new = mx
             self._current_shields[f] = new
@@ -2060,6 +2125,29 @@ class ShieldSubsystem(PoweredSubsystem):
             self._shield_watchers[f]._update(self.GetSingleShieldPercentage(f))
         self._shield_watchers[self.NUM_SHIELDS]._update(
             self.GetShieldPercentage())
+
+    def _regen_power_factor(self) -> float:
+        """Power fraction driving regen.
+
+        Shields up (on): received / normal -- the Shields control x any supply
+        shortfall -- capped at the control setting; the control setting itself
+        before a power source is bound. Shields lowered (green alert, cloak):
+        full rate -- on stbc.exe a lowered generator kept regenerating at
+        9.2-9.5/s (S5, `regen_{red,yellow,green}_face50`), and what the control
+        does to a lowered generator is unmeasured."""
+        try:
+            if not self.IsOn():
+                return 1.0
+            wanted = max(0.0, float(self.GetPowerPercentageWanted()))
+            # A power hand-out the generator missed: no regen until the next
+            # one (measured: core 30% -> shields fed 1 in 3, regen ~1/3, PW2).
+            if getattr(self, "_handout_fed", None) is False:
+                return 0.0
+            if getattr(self, "_power_source", None) is not None:
+                return max(0.0, min(float(self._power_factor), wanted))
+            return wanted
+        except Exception:
+            return 1.0
 
     def ApplyDamage(self, face: int, amount: float) -> float:
         """Absorb a hit on the face; return what reaches the hull.
@@ -2141,6 +2229,11 @@ class PowerSubsystem(ShipSubsystem):
         self._main_conduit_current: float = 0.0
         self._backup_conduit_current: float = 0.0
         self._interval_elapsed: float = 0.0
+        self._handout_elapsed: float = 0.0
+        self._handout_late_elapsed: float = 0.0
+        self._budget_primed: bool = False
+        self._handout_since: float = self.HANDOUT_PERIOD
+        self._handout_late_since: float = self.HANDOUT_PERIOD
         self._power_dispensed: float = 0.0
         self._power_wanted_total: float = 0.0
         # FloatRangeWatchers handed to Conditions/ConditionPowerBelow.py:44-46;
@@ -2295,6 +2388,22 @@ class PowerSubsystem(ShipSubsystem):
 
     POWER_INTERVAL: float = 1.0   # seconds of game time; BC constant 0x892E20
 
+    def _reactor_stopped(self) -> bool:
+        """`_is_offline` minus the disabled test: destroyed, radiation outage
+        (own or system), or the ship out of action. A merely disabled core
+        keeps producing (see the interval comment in Update)."""
+        if self.IsDestroyed():
+            return True
+        if getattr(self, "_radiation_out", False) is True:
+            return True
+        parent = getattr(self, "_parent_subsystem", None)
+        if parent is not None and getattr(parent, "_radiation_out", False) is True:
+            return True
+        if implements(self, "GetParentShip"):
+            if _ship_death._out_of_action(self.GetParentShip()):
+                return True
+        return False
+
     def _add_power_to_batteries(self, amount: float) -> None:
         """Main first (capped), spill to backup (capped), discard the rest."""
         main_cap = self.GetMainBatteryLimit()
@@ -2364,6 +2473,19 @@ class PowerSubsystem(ShipSubsystem):
         if prop is None:
             return
         dt = float(dt)
+        if not self._budget_primed:
+            # A new ship has a full conduit budget from its first frame (no
+            # stall at spawn waiting for the first once-a-second tick): the
+            # same budget the interval tick computes, from the batteries as
+            # they stand, with the hand-outs phased from now.
+            self._budget_primed = True
+            self._main_conduit_current = min(self._main_battery_power,
+                                             self._rated_main_conduit_capacity() * self.POWER_INTERVAL)
+            self._backup_conduit_current = min(self._backup_battery_power,
+                                               self._rated_backup_conduit_capacity() * self.POWER_INTERVAL)
+            self._available_power = self._main_conduit_current + self._backup_conduit_current
+            self._handout_elapsed = self.HANDOUT_PERIOD
+            self._handout_late_elapsed = self.HANDOUT_PERIOD - self.HANDOUT_PHASE_LATE
         self._interval_elapsed += dt
         if self._interval_elapsed >= self.POWER_INTERVAL:
             elapsed = self._interval_elapsed
@@ -2372,7 +2494,11 @@ class PowerSubsystem(ShipSubsystem):
             # Tests mirror this exact float path via _accum_elapsed() arithmetic.
             self._interval_elapsed = 0.0
             self._power_dispensed = 0.0
-            if not _is_offline(self):
+            # A DISABLED core still generates PowerOutput x condition: on
+            # stbc.exe a Galaxy core at 49% (below its 50% threshold) charged
+            # the main battery at +490/s (stbc-oracle reference §6.1). Only
+            # destroyed / radiation outage / ship out of action stops output.
+            if not self._reactor_stopped():
                 self._add_power_to_batteries(self.GetPowerOutput() * elapsed)
             # Deliberate asymmetry: recharge is gated on reactor-offline, but
             # conduit budgets (capacity*elapsed) are computed UNCONDITIONALLY.
@@ -2389,6 +2515,11 @@ class PowerSubsystem(ShipSubsystem):
             self._backup_conduit_current = min(self._backup_battery_power, backup_max)
             self._available_power = (self._main_conduit_current
                                      + self._backup_conduit_current)
+            # The hand-outs run on the budget's clock: the early group at this
+            # reset, the late group HANDOUT_PHASE_LATE after it, then every
+            # HANDOUT_PERIOD.
+            self._handout_elapsed = self.HANDOUT_PERIOD
+            self._handout_late_elapsed = self.HANDOUT_PERIOD - self.HANDOUT_PHASE_LATE
         self._pump_consumers(dt)     # Task 4 fills this in
         main_cap = self.GetMainBatteryLimit()
         backup_cap = self.GetBackupBatteryLimit()
@@ -2402,48 +2533,99 @@ class PowerSubsystem(ShipSubsystem):
             self._backup_battery_power / backup_cap if backup_cap > 0.0 else 0.0
         )
 
-    def _pump_consumers(self, dt: float) -> None:
-        """Per-frame consumer draw pass.  Walks the ship's powered consumers in
-        attach order (= BC draw priority) and lets each draw its per-tick demand
-        from the conduit budget + battery via _draw.  _power_wanted_total sums
-        the demand for the WeaponsDisplay / diagnostics readout.
+    # How BC hands out power (stbc-oracle power_core / power_budget2 `xq`
+    # rows, reference §6.4). The one-second conduit budget is spent in time
+    # order until it runs out:
+    #   * energy weapons (phasers, pulse, tractors) take their share every
+    #     frame, all-or-nothing (a phaser topping up draws 5 a frame);
+    #   * every other system is served 3 times a second, all-or-nothing, in
+    #     two hand-outs: the shields and impulse engines HANDOUT_PHASE_LATE
+    #     after the budget resets (they are always fed or starved together in
+    #     the captures, the impulse engines even when their small share would
+    #     still fit -- so once the shields miss, the impulse engines miss too),
+    #     the other systems (sensors, torpedoes, repair...) at the reset, each
+    #     group served together (_serve_group).
+    # Big draws are the first to stop fitting as the budget runs down: the
+    # captures' "biggest cut first". This reproduces the measured fed
+    # fractions -- shields + impulse 3/3, 2/3, 2/3, 1/3 and sensors +
+    # torpedoes 3/3, 3/3, 3/3, 2/3 at core 100 / 60 / 49 / 30%.
+    HANDOUT_PERIOD: float = 1.0 / 3.0
+    HANDOUT_PHASE_LATE: float = 5.0 / 60.0
 
-        Called every Update (not just on the interval tick) so between-interval
-        frames still deplete the seeded conduit budget smoothly."""
+    def _pump_consumers(self, dt: float) -> None:
+        """Spend this frame's share of the conduit budget (see HANDOUT_PERIOD).
+
+        Consumers with their own draw rule (a direct siphon off the main
+        battery, the cloak's reserve drain -- any class overriding
+        _update_power) keep it. Per-frame consumers (energy weapons) draw
+        every frame, all-or-nothing. The rest are served at their group's
+        hand-out, each its whole demand for the period or nothing, and keep
+        that fed / starved state until the next one."""
         ship = self.GetParentShip()
         consumers = getattr(ship, "_powered_consumers", None) if ship is not None else None
         if not consumers:
             return
+        dt = float(dt)
+        due_early = due_late = False
+        # _handout_*elapsed schedule the hand-outs (re-phased at each budget
+        # reset); _handout_*since is the real time since the group was last
+        # served, which is what a hand-out's demand covers.
+        self._handout_since += dt
+        self._handout_late_since += dt
+        self._handout_elapsed += dt
+        if self._handout_elapsed >= self.HANDOUT_PERIOD - 1e-9:
+            period_early = self._handout_since
+            self._handout_elapsed = 0.0
+            self._handout_since = 0.0
+            due_early = True
+        self._handout_late_elapsed += dt
+        if self._handout_late_elapsed >= self.HANDOUT_PERIOD - 1e-9:
+            period_late = self._handout_late_since
+            self._handout_late_elapsed = 0.0
+            self._handout_late_since = 0.0
+            due_late = True
+        early_group, late_group = [], []
+        for consumer in consumers:
+            if (consumer.DRAWS_DIRECT_FROM_MAIN
+                    or type(consumer)._update_power is not _BASE_UPDATE_POWER):
+                consumer._update_power(dt, self)
+            elif consumer.POWER_EVERY_FRAME:
+                consumer._apply_handout(dt, consumer._handout_demand(dt), self)
+            elif consumer.POWER_HANDOUT_LATE:
+                late_group.append(consumer)
+            else:
+                early_group.append(consumer)
+        if due_early and early_group:
+            self._serve_group(early_group, period_early)
+        if due_late and late_group:
+            self._serve_group(late_group, period_late)
         total = 0.0
         for consumer in consumers:
-            consumer._update_power(dt, self)
-            # _power_wanted, not GetPowerWanted(): _update_power just wrote the
-            # attribute one line ago, and PoweredSubsystem's getter is a bare
-            # `return self._power_wanted`. At 9.4 consumers x 101 ships x 15
-            # ticks that accessor alone was ~14,000 calls per frame for no
-            # information.
-            #
-            # But "the getter is that bare return" is a property of ONE class,
-            # not of the interface: PowerSubsystem.GetPowerWanted returns
-            # _power_wanted_total, an entirely different field. It cannot reach
-            # this list today (PowerSubsystem derives from ShipSubsystem, so
-            # ShipClass.AddPoweredConsumer's isinstance(PoweredSubsystem) gate
-            # rejects it), but an unguarded inline turns any future
-            # getter-overriding consumer from a working case into a silently
-            # wrong total.
-            #
-            # Measured, not asserted (2M-iteration timeit, this interpreter):
-            # bare field 20 ns, guard + field 47 ns, method call 53 ns. So the
-            # guard is still cheaper than the call it avoids, and its 27 ns
-            # premium over the naked read is 6.7% of the 404 ns _update_power
-            # that shares the loop body -- about 26 us/frame at 9.4 consumers
-            # x 101 ships. That buys back correctness for every future
-            # consumer shape at a cost the profile cannot see.
             if type(consumer).GetPowerWanted is _BASE_GET_POWER_WANTED:
                 total += consumer._power_wanted
             else:
                 total += consumer.GetPowerWanted()
         self._power_wanted_total = total
+
+    def _serve_group(self, group, period: float) -> None:
+        """One hand-out: the group is served together, biggest share first;
+        the first system the budget can't cover starves the rest of the group
+        (measured: shields + impulse, and sensors + torpedoes, are each fed or
+        starved together, the smaller one even when its share would fit)."""
+        starved = False
+        for consumer in sorted(group, key=lambda c: -c._handout_demand(period)):
+            wanted = consumer._handout_demand(period)
+            consumer._apply_handout(period, wanted, None if starved else self)
+            if consumer._handout_fed is False and wanted > 0.0:
+                starved = True
+
+    def _can_draw(self, amount: float, mode: int) -> bool:
+        """Whether _draw(amount, mode) would deliver the whole amount."""
+        main = min(self._main_conduit_current, self._main_battery_power)
+        backup = min(self._backup_conduit_current, self._backup_battery_power)
+        if mode == PSM_MAIN_FIRST or mode == PSM_BACKUP_FIRST:
+            return main + backup >= amount - 1e-9
+        return backup >= amount - 1e-9
 
     def _draw(self, amount: float, mode: int) -> float:
         """Depletes conduit budget AND battery to satisfy up to ``amount``,
@@ -3249,4 +3431,6 @@ def impulse_fractions(ies):
     if not ies.IsOn():
         return online, 0.0
     cur = max(0.0, min(1.0, cur))
+    if getattr(ies, "_handout_fed", None) is False:
+        return online, 0.0          # missed power hand-out: coast (impulse_output_fraction)
     return online, cur * ies.GetPowerPercentageWanted()

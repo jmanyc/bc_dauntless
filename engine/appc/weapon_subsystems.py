@@ -2087,6 +2087,7 @@ class _HeldFireWeaponSystem(WeaponSystem):
 
 
 class PhaserSystem(_HeldFireWeaponSystem):
+    POWER_EVERY_FRAME = True   # draws its share every frame (BC power hand-outs, subsystems.py)
     # Power-level constants from sdk/.../App.py:6444-6446 (three levels).
     # Values confirmed against the real BC engine (dev-console probe: HIGH=2,
     # LOW=0). PP_LOW is the "disable, don't destroy" mode — it deals no hull
@@ -2140,6 +2141,7 @@ class PulseWeaponSystem(_HeldFireWeaponSystem):
     (no fire-range gate — a bolt's lifetime bounds its range, so the only
     fire gates are arc + charge + cooldown).
     """
+    POWER_EVERY_FRAME = True   # draws its share every frame (BC power hand-outs, subsystems.py)
     pass
 
 
@@ -2163,6 +2165,7 @@ class TractorBeamSystem(_HeldFireWeaponSystem):
     HOLD world-point / TOW body-frame offset); it is invalidated on StopFiring
     and on any mode change.
     """
+    POWER_EVERY_FRAME = True   # draws its share every frame (BC power hand-outs, subsystems.py)
     # host_loop._pump_held_weapons: skip the generic hard-stop gates and hand
     # the frame straight to update_weapons (it owns its own stop conditions).
     _pump_self_managed = True

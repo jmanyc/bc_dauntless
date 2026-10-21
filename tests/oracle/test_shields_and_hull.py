@@ -82,8 +82,6 @@ def test_s2_face_below_one_tenth_is_bypassed(oracle):
 
 # ── §5.3 regeneration ────────────────────────────────────────────────────────────
 
-@bible_xfail("S4", "each face regains 6.15 points every 0.656 s (≈ 9.4/s) at full generator power",
-             "11/s (the hardpoint ShieldChargePerSecond as-is) on a 0.5 s cadence — the 0.85 factor between the authored 11 and the measured 9.4 has no known mechanism")
 def test_s4_face_regen_rate(oracle):
     """S4 — every capture after firing stops: −6.1/−6.2 steps every 0.656 s."""
     s = oracle(attacker="KessokHeavy", range_gu=57)
@@ -113,8 +111,13 @@ def test_s5_regen_identical_across_alert_levels(oracle, alert):
     assert (s.face(FRONT) - before) / 6.0 == pytest.approx(r_red, rel=0.05)
 
 
-def test_s5_regen_independent_of_generator_power_wanted(oracle):
-    """S5 — `regen_power50_face50`."""
+def test_s5_regen_scales_with_shields_power(oracle):
+    """Regen is linear in the Shields power control (2026-10-16 stbc-oracle
+    `power_effects`: 0 / 2.38 / 4.72 / 7.12 / 9.44 / 11.85 per s at 0-125%;
+    `torp_reload_power`: 4.71/s at 50%). This replaces the bible's S5 power
+    line ("independent of generator power wanted", `regen_power50_face50`):
+    that capture's own rows show the full 9.24/s, i.e. its 50% setting did not
+    take effect in that run."""
     full = oracle(attacker="KessokHeavy", range_gu=57)
     full.preset_face(FRONT, 0.5)
     b = full.face(FRONT); full.run(6.0)
@@ -124,7 +127,7 @@ def test_s5_regen_independent_of_generator_power_wanted(oracle):
     half.preset_face(FRONT, 0.5)
     b = half.face(FRONT); half.run(6.0)
     r_half = (half.face(FRONT) - b) / 6.0
-    assert r_half == pytest.approx(r_full, rel=0.05)
+    assert r_half == pytest.approx(0.5 * r_full, rel=0.05)
 
 
 @pytest.mark.parametrize("condition", [0.5, 0.2])
