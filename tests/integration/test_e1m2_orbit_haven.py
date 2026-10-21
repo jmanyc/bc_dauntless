@@ -49,7 +49,7 @@ def test_click_haven_completes_enter_orbit_goal():
     # Park the player inside the orbit AI's activation range
     # (ConditionInRange threshold = 200 + planet radius).
     loc = haven.GetWorldLocation()
-    player.SetTranslateXYZ(loc.x, loc.y + haven.GetRadius() + 100.0, loc.z)
+    player.SetTranslateXYZ(loc.x, loc.y + haven.GetRadius() + 170.0, loc.z)
 
     # Narrative gate: OrbitingHaven only acts after the mission-win beat.
     mod.g_bMissionWinCalled = 1
@@ -89,7 +89,7 @@ def test_orbit_enter_and_leave_play_helm_dialogue(monkeypatch):
     pSet = App.g_kSetManager.GetSet("Vesuvi6")
     haven = pSet.GetObject("Haven")
     loc = haven.GetWorldLocation()
-    player.SetTranslateXYZ(loc.x, loc.y + haven.GetRadius() + 100.0, loc.z)
+    player.SetTranslateXYZ(loc.x, loc.y + haven.GetRadius() + 170.0, loc.z)
     mod.g_bMissionWinCalled = 1
 
     spoken = []

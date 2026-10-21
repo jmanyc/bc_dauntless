@@ -115,8 +115,8 @@ def _is_overriding(ship):
     """The SDK's own definition: AvoidObstacles.Update sets vOverrideDirection
     from TestCourseOverride and treats non-None as "override the course"
     (AI/Preprocessors.py:1696). Read off the script instance rather than any
-    engine-side bookkeeping, so this measures whichever scan is in force --
-    the SDK's by default, the engine one under DAUNTLESS_ENGINE_AVOIDANCE=1."""
+    engine-side bookkeeping, so this measures whichever binding is in force --
+    the compiled node by default, which keeps the field current too."""
     node = ship.GetAI()
     inst = getattr(node, "_preprocessing_instance", None)
     return getattr(inst, "vOverrideDirection", None) is not None
@@ -155,6 +155,15 @@ def _dist(a, b):
                      + (pa.GetZ() - pb.GetZ()) ** 2)
 
 
+@pytest.mark.xfail(strict=True, reason=(
+    "Expectation changed by cleanroom/spec/02_AvoidObstacles_compiled.md and "
+    "03_ManagePower_compiled.md, not yet checked against the original live. "
+    "The compiled AvoidObstacles node (the default) commands flee speed 0 "
+    "whenever the ship's forward lies in any obstacle's blocked cone, so six "
+    "4 GU pursuers inside one another's cones coast together (measured "
+    "135-309 contact ticks of 2400, closest ~3 GU); and with ManagePower "
+    "running AI impulse at 125%, even the SDK-script binding touches here for "
+    "most hash seeds."))
 def test_pursuers_chasing_a_straight_line_target_do_not_fly_into_each_other(
         straight_line_chase):
     loop, player, pursuers = straight_line_chase

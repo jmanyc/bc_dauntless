@@ -26,6 +26,17 @@ from engine.appc.ships import ShipClass
 
 
 @pytest.fixture(autouse=True)
+def _sdk_avoid_obstacles_binding():
+    """These tests pin the SDK-script binding (SDK scan, phase offset, evading
+    cadence). The compiled node is the default now
+    (cleanroom/spec/02_AvoidObstacles_compiled.md), so select the SDK binding
+    explicitly and restore the default afterwards."""
+    previous = ai_optimized.use_avoid_obstacles_binding("sdk")
+    yield
+    ai_optimized.OPTIMIZED_PREPROCESSORS["AvoidObstacles"] = previous
+
+
+@pytest.fixture(autouse=True)
 def _isolate_dynamic_classes():
     """Undo the dynamic classes these tests cause ai_optimized to mint.
 
@@ -43,7 +54,8 @@ def _isolate_dynamic_classes():
     """
     caches = (ai_optimized._NON_LETHAL_CLASSES,
               ai_optimized._PHASED_AVOIDANCE_CLASSES,
-              ai_optimized._ENGINE_AVOIDANCE_CLASSES)
+              ai_optimized._ENGINE_AVOIDANCE_CLASSES,
+              ai_optimized._COMPILED_AVOIDANCE_CLASSES)
     before_caches = [dict(c) for c in caches]
     before_globals = dict(vars(ai_optimized))
     yield

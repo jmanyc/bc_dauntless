@@ -466,6 +466,35 @@ def _replace_avoid_obstacles(instance):
     return _apply_evading_cadence(alias)
 
 
+_COMPILED_AVOIDANCE_CLASSES: dict = {}
+
+
+def _compiled_avoidance_class(base: type) -> type:
+    """The compiled AvoidObstacles node (engine/appc/compiled_avoid_obstacles.py,
+    cleanroom/spec/02_AvoidObstacles_compiled.md) mixed in ahead of the
+    non-lethal SDK class: it replaces Update and GetNextUpdateTime and reads
+    none of the SDK instance's tunables; the SDK surface (pickle hooks, the
+    fields other code reads) stays."""
+    cached = _COMPILED_AVOIDANCE_CLASSES.get(base)
+    if cached is not None:
+        return cached
+    from engine.appc.compiled_avoid_obstacles import CompiledAvoidObstaclesMixin
+    cls = type("Compiled" + base.__name__,
+               (CompiledAvoidObstaclesMixin, _non_lethal_class(base)), {})
+    _COMPILED_AVOIDANCE_CLASSES[base] = cls
+    globals()[cls.__name__] = cls
+    return cls
+
+
+def _compile_avoid_obstacles(instance):
+    """The DEFAULT AvoidObstacles binding: the compiled node over the SDK
+    instance's state."""
+    cls = _compiled_avoidance_class(type(instance))
+    alias = cls.__new__(cls)
+    alias.__dict__ = instance.__dict__
+    return alias
+
+
 def _replace_manage_power(instance):
     """Swap the SDK's ManagePower stub for the engine-side class above."""
     # Carry the ctor arg across the swap, as the native ctor does by reading
@@ -614,19 +643,39 @@ def _wrap_non_lethal(instance):
 OPTIMIZED_PREPROCESSORS: dict = {
     "ManagePower": _replace_manage_power,     # real replacement (SDK body is a stub)
     "FireScript": _compile_fire_script,       # compiled node, PS_DONE de-fanged
-    # SDK scan, PS_DONE de-fanged, plus the phase offset and evading cadence.
-    # This entry has always done TWO jobs and only one of them was the problem:
-    # the engine scan (removed below, opt-in) and protection against
-    # AvoidObstacles' lethal PS_DONE path, which a shipless node hits. Dropping
-    # the whole entry would have taken the protection with it --
-    # test_preprocess_done_is_lethal caught exactly that.
-    "AvoidObstacles": _wrap_avoid_obstacles,
+    # The compiled node (cleanroom/spec/02_AvoidObstacles_compiled.md). It is
+    # non-lethal by construction: with no ship it runs the contained AI.
+    "AvoidObstacles": _compile_avoid_obstacles,
 }
 
-# ── AvoidObstacles: OFF by default, and why ────────────────────────────────
+# The selectable AvoidObstacles bindings. "compiled" is the default; "sdk" is
+# the SDK scan, PS_DONE de-fanged, plus the phase offset and evading cadence
+# (what shipped before the compiled node); "engine" is the opt-in engine scan
+# described below.
+AVOID_OBSTACLES_BINDINGS: dict = {
+    "compiled": _compile_avoid_obstacles,
+    "sdk": _wrap_avoid_obstacles,
+    "engine": _replace_avoid_obstacles,
+}
+
+
+def use_avoid_obstacles_binding(name: str):
+    """Select which AvoidObstacles binding new trees get; returns the previous
+    factory so a caller (a test fixture) can restore it."""
+    previous = OPTIMIZED_PREPROCESSORS["AvoidObstacles"]
+    OPTIMIZED_PREPROCESSORS["AvoidObstacles"] = AVOID_OBSTACLES_BINDINGS[name]
+    return previous
+
+
+if os.environ.get("DAUNTLESS_AVOIDANCE") in AVOID_OBSTACLES_BINDINGS:
+    use_avoid_obstacles_binding(os.environ["DAUNTLESS_AVOIDANCE"])
+
+# ── The ENGINE scan: OFF by default, and why ───────────────────────────────
 #
-# The engine-side scan is opt-in via DAUNTLESS_ENGINE_AVOIDANCE=1. Default is
-# the SDK's own AvoidObstacles.
+# The engine-side scan is opt-in via DAUNTLESS_ENGINE_AVOIDANCE=1 (or
+# DAUNTLESS_AVOIDANCE=engine). The default is the compiled node above;
+# DAUNTLESS_AVOIDANCE=sdk selects the SDK's own AvoidObstacles. The history
+# below is about the engine scan, not the compiled node.
 #
 # It shipped enabled and caused a live gameplay regression: 3 Keldons vs the
 # player in QuickBattle flew around, fired an opening volley, then stopped
