@@ -80,7 +80,12 @@ def _assert_carried(player, pid, condition, changes):
     now = App.Game_GetCurrentPlayer()
     assert id(now) == pid and now is player
     assert [p for _, _, p in changes] == [player]
-    assert now.GetHull().GetCondition() == pytest.approx(condition)
+    # The marked damage carried over: at least the marked level (the repair
+    # bay keeps repairing the hull through the transit, as in the original --
+    # stbc-oracle duels: +5.5 HP/s), and still short of full (a newly built
+    # replacement ship would arrive undamaged).
+    hull = now.GetHull()
+    assert condition - 1e-6 <= hull.GetCondition() < hull.GetMaxCondition()
 
 
 @pytest.fixture(params=["hard_cut", "flythrough"])
