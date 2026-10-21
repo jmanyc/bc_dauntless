@@ -201,6 +201,32 @@ class QuickBattleSetupPanel(Panel):
             except Exception as e:            # an unplannable setup must not
                 _log.warning("quickbattle SDK sync failed: %s", e)  # kill dispatch
 
+    def prewarm(self) -> None:
+        """Do the first open's slow work now, with no visible or SDK effect:
+        each listed ship's hull/shield stats (a hardpoint re-execution each,
+        ~2.4 s for the stock ships; persisted on disk after the first time),
+        the QuickBattle module import, the species icons and the bios.
+        Called once at boot -- opening the screen the first time used to freeze
+        the game for seconds (user report 2026-10-16). Never raises."""
+        import time
+        t0 = time.perf_counter()
+        try:
+            entries = list(self._catalog_fn())
+            self._qb()
+            for ce in entries:
+                self._stats.get(ce.ship_id)
+                self._icon(ce.icon)
+                try:
+                    self._bio_fn(ce)
+                except Exception:  # noqa: BLE001 - decoration only
+                    pass
+            for name, flagship in self._species_table_for(entries):
+                self._insignia(name)
+                self._icon(flagship)
+        except Exception as e:  # noqa: BLE001 - an optimisation must never break boot
+            _log.warning("quickbattle prewarm skipped: %s", e)
+        _log.info("quickbattle prewarm %.2fs", time.perf_counter() - t0)
+
     # ── Catalog ─────────────────────────────────────────────────────────
     def _refresh_catalog(self) -> None:
         entries = list(self._catalog_fn())
@@ -238,9 +264,13 @@ class QuickBattleSetupPanel(Panel):
         """STOCK_SPECIES in pill order, then any species the listed entries use
         that the table does not know, alphabetically -- catalog.species()'s
         rule, applied to THIS panel's entries."""
+        return self._species_table_for(self._entries)
+
+    @staticmethod
+    def _species_table_for(entries) -> list:
         from engine.ship_catalog import STOCK_SPECIES
         known = {s.name.lower() for s in STOCK_SPECIES}
-        extra = sorted({e.species for e in self._entries
+        extra = sorted({e.species for e in entries
                         if e.species and e.species.lower() not in known}, key=str.lower)
         return [(s.name, s.flagship) for s in STOCK_SPECIES] + [(n, None) for n in extra]
 

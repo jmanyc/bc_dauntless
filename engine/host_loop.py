@@ -10558,6 +10558,10 @@ def run(mission_name: Optional[str] = None,
         quick_battle_setup_panel = QuickBattleSetupPanel(
             on_start=lambda: controller.loader.start_quickbattle())
         controller.quick_battle_setup_panel = quick_battle_setup_panel
+        # Its first open used to stall the game for seconds (each ship's
+        # stats re-run its hardpoint script); do that work here, at boot,
+        # where it is cached to disk for the next launch.
+        quick_battle_setup_panel.prewarm()
 
         from engine.ui.pause_menu import default_pause_menu
         def _quit_and_manage_mods():
