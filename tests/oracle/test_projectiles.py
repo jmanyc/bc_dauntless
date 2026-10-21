@@ -213,3 +213,57 @@ def test_t4_ammo_switch_unloads_tubes(oracle):
     s.fire("torpedo")
     launches = _launches(s, 30.0)
     assert launches == [], launches
+
+
+def _tube_events(monkeypatch):
+    """Record (event type name, source, destination name) for torpedo events."""
+    import App
+    seen = []
+    orig = App.g_kEventManager.AddEvent
+
+    def add(evt):
+        try:
+            et = evt.GetEventType()
+            if et in (App.ET_TORPEDO_FIRED, App.ET_TORPEDO_RELOAD):
+                d = evt.GetDestination()
+                seen.append(("FIRED" if et == App.ET_TORPEDO_FIRED else "RELOAD", evt.GetSource(),
+                             d.GetName() if d is not None else None))
+        except Exception:
+            pass
+        return orig(evt)
+    monkeypatch.setattr(App.g_kEventManager, "AddEvent", add)
+    return seen
+
+
+def test_t4_ammo_switch_tells_the_tubes_listeners(oracle, monkeypatch):
+    """The original (stbc-oracle results_mac/ammoswitch_sovereign3.json): a
+    one-argument SetAmmoType -- the AI's call -- posts ET_TORPEDO_FIRED with NO
+    source for every emptied tube, so ConditionTorpsReady re-counts and reads
+    0. Without it the AI's "torpedoes ready" stayed true over six empty tubes
+    and it made forward torpedo runs that fired nothing."""
+    s = oracle(attacker="Sovereign", range_gu=57)
+    ts = s.weapon_system("torpedo")
+    tubes = [ts.GetChildSubsystem(i) for i in range(ts.GetNumChildSubsystems())]
+    assert all(t.GetNumReady() > 0 for t in tubes)
+    seen = _tube_events(monkeypatch)
+    ts.SetAmmoType(1)
+    assert all(t.GetNumReady() == 0 for t in tubes)
+    fired = [e for e in seen if e[0] == "FIRED"]
+    assert sorted(e[2] for e in fired) == sorted(t.GetName() for t in tubes)
+    assert all(e[1] is None for e in fired), "an unload has no projectile source"
+    assert not [e for e in seen if e[0] == "RELOAD"]
+
+
+def test_t4_ammo_switch_with_zero_reloads_at_once(oracle, monkeypatch):
+    """SetAmmoType(t, 0) (mission scripts, docking): the original unloads and
+    reloads every tube with the new type at once -- ET_TORPEDO_FIRED then
+    ET_TORPEDO_RELOAD per tube, all still ready (ammoswitch_sovereign2.json)."""
+    s = oracle(attacker="Sovereign", range_gu=57)
+    ts = s.weapon_system("torpedo")
+    tubes = [ts.GetChildSubsystem(i) for i in range(ts.GetNumChildSubsystems())]
+    seen = _tube_events(monkeypatch)
+    ts.SetAmmoType(1, 0)
+    assert all(t.GetNumReady() == t.GetMaxReady() for t in tubes)
+    for t in tubes:
+        kinds = [e[0] for e in seen if e[2] == t.GetName()]
+        assert kinds == ["FIRED", "RELOAD"], (t.GetName(), kinds)

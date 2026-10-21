@@ -1696,7 +1696,7 @@ class TorpedoSystem(WeaponSystem):
         # torpedo launched by ANY tube on this system.  A fresh system inits
         # to -1000.0 (same convention as TorpedoTube._last_fire_time) so the
         # first shot always passes the 0.5s stagger gate.  Skew-fire tubes
-        # are exempt (TorpedoTube.CanFire checks IsSkewFire() first).
+        # pass it only in the tick of the stamp (the salvo's partners).
         self._last_system_fire_time: float = -1000.0
 
     def StartFiring(self, target=None, offset=None) -> None:
@@ -1878,14 +1878,29 @@ class TorpedoSystem(WeaponSystem):
         # slot table (hardpoint setup); SetAmmoType merely selects a slot.
         self._ammo_by_slot[len(self._ammo_by_slot)] = ammo_type
 
-    def SetAmmoType(self, ammo_index, _reload_arg=0) -> None:
+    def SetAmmoType(self, ammo_index, delayed_reload=1) -> None:
         # SDK semantics: SELECT the ammo type at index `ammo_index` (0-based,
         # same domain as GetAmmoTypeNumber / range(GetNumAmmoTypes())).  Never
         # a store — hardpoint setup populates slots via AddAmmoType.  Call
-        # sites: AI/Preprocessors.py:548,640 (int index from ChooseTorpType),
-        # ShipScriptActions.py:400, MissionLib.py:611, E2M0.py:720
-        # (App.AT_TWO = 1).  Second arg is always 0 in the SDK (reload
-        # time/flag) — accepted, ignored.
+        # sites: AI/Preprocessors.py:548,640 (int index from ChooseTorpType,
+        # ONE argument), ShipScriptActions.py:400, MissionLib.py:611,
+        # E2M0.py:720 (App.AT_TWO = 1; second argument 0).
+        #
+        # The second argument picks the reload, measured on the original
+        # (stbc-oracle results_mac/ammoswitch_sovereign2/3.json, a Sovereign
+        # with all six tubes loaded switching photon -> quantum):
+        #   SetAmmoType(t)    -> every tube posts ET_TORPEDO_FIRED (no source,
+        #                        destination the tube) and empties; each reloads
+        #                        after its ReloadDelay (ET_TORPEDO_RELOAD 40.9 s
+        #                        later).
+        #   SetAmmoType(t, 0) -> every tube posts ET_TORPEDO_FIRED then
+        #                        ET_TORPEDO_RELOAD at once: reloaded with the
+        #                        new type, still ready.
+        # ConditionTorpsReady re-counts the tubes on ET_TORPEDO_FIRED; without
+        # the event the AI's "torpedoes ready" stayed true over six empty
+        # tubes after its opening photon -> quantum switch and it spent its
+        # first forward torpedo run, ~10 s of turning, firing nothing (one
+        # forward run in three empty; Sovereign launches 6.5/min vs 7.5).
         #
         # Switching to a DIFFERENT type unloads every tube: measured on the
         # original exe (stbc-oracle bible §4 T4, `torpedo_sovereign_quantum_57`)
@@ -1898,15 +1913,27 @@ class TorpedoSystem(WeaponSystem):
         before = self.GetCurrentAmmoSlot()
         self.SetCurrentAmmoSlot(int(ammo_index))
         if self.GetCurrentAmmoSlot() != before:
-            for i in range(self.GetNumWeapons()):
-                tube = self.GetWeapon(i)
-                unload = getattr(tube, "UnloadTorpedo", None)
-                if not callable(unload):
-                    continue
-                ready = getattr(tube, "GetNumReady", None)
-                n = int(ready()) if callable(ready) else 0
-                for _ in range(n):
-                    unload()
+            self._unload_all_tubes(instant_reload=not delayed_reload)
+
+    def _unload_all_tubes(self, instant_reload: bool = False) -> None:
+        """Empty every tube (the type-switch unload, TorpedoTube.UnloadTorpedo),
+        posting the original's events; with `instant_reload` refill it at once
+        (see SetAmmoType)."""
+        for i in range(self.GetNumWeapons()):
+            tube = self.GetWeapon(i)
+            unload = getattr(tube, "UnloadTorpedo", None)
+            if not callable(unload):
+                continue
+            ready = getattr(tube, "GetNumReady", None)
+            n = int(ready()) if callable(ready) else 0
+            for _ in range(n):
+                unload()
+            if n > 0 and hasattr(tube, "_broadcast_unload"):
+                tube._broadcast_unload()
+            if instant_reload and hasattr(tube, "SetNumReady") and hasattr(tube, "GetMaxReady"):
+                tube.SetNumReady(tube.GetMaxReady())
+                if hasattr(tube, "_broadcast_reload"):
+                    tube._broadcast_reload()
 
     def GetAmmoType(self, slot: int):
         return self._ammo_by_slot.get(int(slot))
@@ -1956,6 +1983,12 @@ class TorpedoSystem(WeaponSystem):
         except ValueError:
             idx = 0
         self._selected_slot = slots[(idx + 1) % len(slots)]
+        # The player's switch empties the tubes exactly like SetAmmoType: BC
+        # has one type-switch path, which unloads every tube (the T4 capture
+        # cited on SetAmmoType), so the first salvo of the new
+        # type waits the full ReloadDelay (40 s on the Sovereign).
+        if self.GetCurrentAmmoSlot() != current:
+            self._unload_all_tubes()
         self._announce_player_type_change(current)
 
     def _announce_player_type_change(self, previous_slot) -> None:
@@ -2026,9 +2059,9 @@ class TorpedoSystem(WeaponSystem):
         (0x0057B1F0) with zero callers anywhere in stbc.exe. Dauntless
         deliberately wires the intended design over the shipped bug: a
         non-Single chain fans a true simultaneous salvo (skew tubes are
-        exempt from the 0.5s ship-wide stagger — see TorpedoTube.CanFire —
-        so every member of the active chain group launches in the same
-        tick, geometry from each tube's authored Right vector); Single
+        exempt from the 0.5s ship-wide stagger in the stamping tick only —
+        see TorpedoTube.CanFire — so every member of the active chain group
+        launches in the same tick, the next group 0.656 s later, geometry from each tube's authored Right vector); Single
         restores BC's shipped walk-out.
 
         [0] is BOTH the chainless fallback and the SDK-documented "group of
@@ -3164,15 +3197,23 @@ class TorpedoTube(Weapon):
         every ready tube in the working group in the same tick now only
         launches the first one (it stamps parent._last_system_fire_time; the
         rest fail this gate within the same tick since gameTime delta is 0).
-        Skew-fire tubes are exempt — they're the deliberately-desynced spread
-        pattern, not the ship-wide volley.
+        Skew-fire tubes pass in the stamping tick only, so a spread salvo
+        launches together and the next salvo waits the gate (measured: Dual
+        pairs 0.65 s apart).
         """
         parent = self.GetParentSubsystem()
         if parent is None or not parent.IsOn():
             return 0
-        if (not self.IsSkewFire() and parent is not None
-                and _game_time() - getattr(parent, "_last_system_fire_time", -1000.0) <= 0.5):
-            return 0
+        if parent is not None:
+            # A spread salvo (skew-fire tubes of the active group) launches in
+            # ONE tick, then waits out the ship-wide gate like any shot:
+            # measured on stbc.exe, Dual fires two tubes at once with the
+            # pairs 0.65 s apart (0.5 s gate + one 0.156 s attempt, as single
+            # fire) and Quad all four at once (stbc-oracle reference §8.3).
+            # So only a skew tube in the SAME tick as the stamp is exempt.
+            since = _game_time() - getattr(parent, "_last_system_fire_time", -1000.0)
+            if since <= 0.5 and not (self.IsSkewFire() and since == 0.0):
+                return 0
         if self._num_ready <= 0:
             return 0
         # Audited gate 2 (spec §3.3): this tube must not itself be disabled
@@ -3486,6 +3527,20 @@ class TorpedoTube(Weapon):
         except Exception as _e:
             dev_mode.log_swallowed("ET_TORPEDO_RELOAD broadcast", _e)
 
+    def _broadcast_unload(self) -> None:
+        """Post the ET_TORPEDO_FIRED an ammo-type switch posts per emptied tube:
+        NO source, destination the tube (measured, see TorpedoSystem.SetAmmoType).
+        Episode7's handler casts the source to a Torpedo and ignores it."""
+        import App
+        from engine import dev_mode
+        try:
+            evt = App.TGEvent_Create()
+            evt.SetEventType(App.ET_TORPEDO_FIRED)
+            evt.SetDestination(self)
+            App.g_kEventManager.AddEvent(evt)
+        except Exception as _e:
+            dev_mode.log_swallowed("ammo-switch ET_TORPEDO_FIRED broadcast", _e)
+
     def _broadcast_torpedo_fired(self, torp) -> None:
         """Post ET_TORPEDO_FIRED: Source = the PROJECTILE, Destination = the TUBE.
 
@@ -3521,6 +3576,37 @@ class TorpedoTube(Weapon):
             App.g_kEventManager.AddEvent(evt)
         except Exception as _e:
             dev_mode.log_swallowed("ET_TORPEDO_FIRED broadcast", _e)
+
+    # The original's tube firing cone (TorpedoTube.CanHit == IsInArc): every
+    # tube of 14 classes, whatever its torpedo, answers yes for directions
+    # within 30.5-31.5 deg of the tube (121 cells of a 5 deg grid at 150 GU;
+    # stbc-oracle results_mac/arcs150_*.json, catalogue_arcs_r150.json), and
+    # its AI fires forward torpedoes with the target up to 30 deg off the nose
+    # (426 launches, Galaxy/Sovereign duels_ai).
+    TUBE_CONE_COS = _math.cos(_math.radians(31.0))
+
+    def IsInArc(self, target_world_point) -> int:
+        """1 if `target_world_point` is within the tube's ~31 deg firing cone,
+        measured from the tube's mount along its world direction. The SDK
+        never calls this; the AI's fire decision does (FireScript wrapper,
+        engine/appc/ai_optimized.py)."""
+        if not isinstance(target_world_point, TGPoint3):
+            return 0
+        ship = self._climb_to_ship()
+        origin = subsystem_world_position(self, ship, mount=True) if ship is not None else None
+        if origin is None:
+            return 0
+        dx, dy, dz = (target_world_point.x - origin.x, target_world_point.y - origin.y,
+                      target_world_point.z - origin.z)
+        dist = _math.sqrt(dx * dx + dy * dy + dz * dz)
+        if dist <= 0.0:
+            return 0
+        d = _emitter_world_direction(self, ship)
+        return 1 if (d.x * dx + d.y * dy + d.z * dz) / dist >= self.TUBE_CONE_COS else 0
+
+    def CanHit(self, target_world_point) -> int:
+        """The original answers TorpedoTube.CanHit exactly as IsInArc."""
+        return self.IsInArc(target_world_point)
 
     def UnloadTorpedo(self) -> None:
         """Remove one ready round; its slot goes back into cooldown.
