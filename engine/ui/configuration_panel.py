@@ -31,7 +31,7 @@ from typing import Callable, List, Optional, Tuple
 from engine.ui.panel import Panel
 
 
-FOV_MIN  = 25
+FOV_MIN  = 20          # reaches BC's own 21 deg lens (engine.cameras.EXTERIOR_FOV_Y_RAD)
 FOV_MAX  = 55
 FOV_STEP = 5
 

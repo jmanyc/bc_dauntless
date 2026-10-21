@@ -569,8 +569,10 @@ def test_chase_snap_resets_distance_and_reverse():
 
 
 def test_fov_distance_scale_is_unity_at_the_reference_fov():
-    from engine.cameras import fov_distance_scale, EXTERIOR_FOV_Y_RAD
-    assert fov_distance_scale(EXTERIOR_FOV_Y_RAD) == pytest.approx(1.0)
+    # Unity at the FOV the framing distances were tuned at (35 deg) -- no longer
+    # the default lens, which is now BC's 21.24 deg.
+    from engine.cameras import fov_distance_scale, FRAMING_REFERENCE_FOV_Y_RAD
+    assert fov_distance_scale(FRAMING_REFERENCE_FOV_Y_RAD) == pytest.approx(1.0)
 
 
 def test_fov_distance_scale_keeps_apparent_size_constant():

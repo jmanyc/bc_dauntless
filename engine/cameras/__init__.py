@@ -14,7 +14,21 @@ import math
 # which also re-syncs the tracking solver's projection math.
 # host_loop.py reads director.fov_y_rad when calling r.set_camera,
 # so the constant is the source of truth at startup only.
-EXTERIOR_FOV_Y_RAD: float = math.radians(35.0)
+#
+# BC's own lens: the player camera's frustum is right 0.25 / top 0.1875 at
+# near 1.0 (stbc-oracle docs/results/cam_galaxy_target.json, `player_camera`),
+# i.e. a vertical FOV of 2 * atan(0.1875) = 21.24 deg (28.1 deg horizontal at
+# 4:3). Dauntless used 35 deg, which drew every distant ship -- the enemy in
+# the default tactical view -- 1.68x smaller than the original (user report
+# 2026-10-16: "the enemy ship is very small"). The default is now BC's lens;
+# the framing distances were tuned at FRAMING_REFERENCE_FOV_Y_RAD and
+# fov_distance_scale pulls the camera back to keep the player's own ship near
+# its tuned size (Tracking: ~3.3 radii behind, BC's capture shows ~4).
+EXTERIOR_FOV_Y_RAD: float = 2.0 * math.atan(0.1875)
+
+# The FOV every framing distance (chase, tracking, zoom-target) was tuned at.
+# fov_distance_scale is relative to THIS, not to the default above.
+FRAMING_REFERENCE_FOV_Y_RAD: float = math.radians(35.0)
 
 # Near/far planes of the exterior scene camera, in game units. Lives here
 # rather than in host_loop because it is not only the camera's: dof.py's
@@ -50,7 +64,7 @@ def fov_distance_scale(fov_y_rad: float) -> float:
     across the exterior FOV setting.
 
     BC had no FOV option; every framing distance here was tuned at
-    EXTERIOR_FOV_Y_RAD. Apparent size goes as r / (d · tan(fov/2)), so
+    FRAMING_REFERENCE_FOV_Y_RAD (35 deg). Apparent size goes as r / (d · tan(fov/2)), so
     holding it constant means d · tan(fov/2) is constant:
 
         scale = tan(ref/2) / tan(fov/2)
@@ -67,7 +81,7 @@ def fov_distance_scale(fov_y_rad: float) -> float:
     Continuous at the reference, and 45° is untouched. With 1.5: 30° is
     ×1.30 (was ×1.19), 25° is ×1.69 (was ×1.42).
     """
-    ratio = math.tan(EXTERIOR_FOV_Y_RAD / 2.0) / math.tan(fov_y_rad / 2.0)
+    ratio = math.tan(FRAMING_REFERENCE_FOV_Y_RAD / 2.0) / math.tan(fov_y_rad / 2.0)
     if ratio > 1.0:
         return ratio ** FOV_NARROW_EXPONENT
     return ratio

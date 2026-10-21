@@ -111,7 +111,7 @@ def test_dispatch_fov_clamps_low():
     p.open()
     p.dispatch_event("fov:10")
     (called_rad,), _ = kw["set_fov_rad"].call_args
-    assert called_rad == pytest.approx(math.radians(25))
+    assert called_rad == pytest.approx(math.radians(20))   # FOV_MIN: reaches BC's 21 deg
 
 
 def test_dispatch_fov_clamps_high():
@@ -294,17 +294,17 @@ def test_right_arrow_on_fov_row_increments():
 
 def test_left_arrow_on_fov_row_decrements_and_clamps():
     p, kw = _make(initial_settings=SettingsSnapshot(
-        fov_deg=25,
+        fov_deg=20,
     ))
     p.open()
     r = _FakeReader()
     for _ in range(p._focusables().index(("ctrl", "fov")) + 1):
         r.press(r.keys.KEY_DOWN); p.handle_input(r)
     r.press(r.keys.KEY_LEFT); p.handle_input(r)
-    # Still 25 (clamped at FOV_MIN), but applier still fires (consistency:
+    # Still 20 (clamped at FOV_MIN), but applier still fires (consistency:
     # every press emits the current state to the renderer).
     (called_rad,), _ = kw["set_fov_rad"].call_args
-    assert called_rad == pytest.approx(math.radians(25))
+    assert called_rad == pytest.approx(math.radians(20))
 
 
 def test_handle_input_missing_optional_keys_does_not_crash():

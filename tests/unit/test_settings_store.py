@@ -378,7 +378,7 @@ def test_reset_restores_native_default_not_the_players_current_value(tmp_path):
     out = reset_and_apply_section(s, ctx, "graphics")
 
     assert out["camera_shake_on"] is True     # native default, not the live False
-    assert out["fov_deg"] == 35               # native default, not the live 55
+    assert out["fov_deg"] == 21               # native default (BC's lens), not the live 55
     ctx.camera_shake.set_enabled.assert_any_call(True)
 
 

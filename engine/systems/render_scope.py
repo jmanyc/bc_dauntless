@@ -22,6 +22,9 @@ still covers at least one pixel at the cull line:
     (ships/Hardpoints/*.py) carry no whole-ship radius -- Hull.SetRadius(1.0)
     on the Galaxy is the hull SUBSYSTEM's -- hence the model extent.
   * 28,917 rounded up to a round number: 30,000 GU (5,250 km).
+  * Derived at 35 deg; the default lens is now BC's 21.24 deg (2026-10-16),
+    at which the Warbird is ~1.7 px at the line -- a slightly earlier pop-out
+    at 5,250 km, far beyond any fight. Kept.
 
 Hysteresis: a hidden ship is shown inside SHIP_DRAW_DISTANCE_GU and a shown
 one hidden only past SHIP_DRAW_DISTANCE_GU * (1 + SHIP_DRAW_HYSTERESIS), so a
