@@ -6047,6 +6047,29 @@ def _model_sphere_radius_from_aabb(center: tuple, half_extents: tuple) -> float:
     return max(abs(hx), abs(hy), abs(hz))
 
 
+_BC_RADII: dict = {}
+
+
+def _bc_measured_radius(ship):
+    """The original's ShipClass.GetRadius for a stock model (engine/appc/bc_ship_radii.json, keyed by the ship's
+    FilenameHigh; stbc-oracle catalogues), or None. No bound of the drawn mesh reproduces it -- the AABB corner
+    is 8% short on a Galaxy, 33% long on a Kessok Heavy -- and the AI's personal space, intercept and warp-in
+    distances read it."""
+    if "t" not in _BC_RADII:
+        try:
+            import json as _json
+            with open(_os_mod.path.join(_os_mod.path.dirname(__file__), "appc", "bc_ship_radii.json")) as f:
+                _BC_RADII["t"] = _json.load(f).get("radius_gu", {})
+        except Exception:  # noqa: BLE001 - no table: the mesh rule
+            _BC_RADII["t"] = {}
+    stats = _ship_stats(ship)
+    rel = (stats or {}).get("FilenameHigh")
+    if not rel:
+        return None
+    v = _BC_RADII["t"].get(str(rel).replace("\\", "/").lower())
+    return float(v) if v else None
+
+
 def _seed_ship_radius(ship, extent: float, sphere_radius: float) -> None:
     """Seed a gameplay GetRadius() (model units -> GU at BC_MODEL_SCALE) for a
     ship that lacks one -- camera-follow distance, AI threat range, splash,
@@ -6062,7 +6085,15 @@ def _seed_ship_radius(ship, extent: float, sphere_radius: float) -> None:
     if ship.GetRadius() > 0.0:
         return
     from engine.rocks.rock import is_rock
-    r = sphere_radius if is_rock(ship) else extent
+    rock = is_rock(ship)
+    measured = None if rock else _bc_measured_radius(ship)
+    if measured is not None:
+        try:
+            ship.SetRadius(measured)
+        except Exception as _e:
+            dev_mode.log_swallowed("realize ship.SetRadius (measured)", _e)
+        return
+    r = sphere_radius if rock else extent
     try:
         ship.SetRadius(r * BC_MODEL_SCALE)
     except Exception as _e:

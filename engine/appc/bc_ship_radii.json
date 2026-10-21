@@ -1,0 +1,19 @@
+{
+ "radius_gu": {
+  "data/models/ships/akira/akira.nif": 2.75679,
+  "data/models/ships/ambassador/ambassador.nif": 3.34392,
+  "data/models/ships/birdofprey/birdofprey.nif": 1.34884,
+  "data/models/ships/cardhybrid/cardhybrid.nif": 4.59699,
+  "data/models/ships/galaxy/galaxy.nif": 4.36646,
+  "data/models/ships/galor/galor.nif": 1.85017,
+  "data/models/ships/keldon/keldon.nif": 2.48488,
+  "data/models/ships/kessokheavy/kessokheavy.nif": 6.17423,
+  "data/models/ships/kessoklight/kessoklight.nif": 2.61947,
+  "data/models/ships/marauder/marauder.nif": 2.57533,
+  "data/models/ships/nebula/nebula.nif": 3.2013,
+  "data/models/ships/sovereign/sovereign.nif": 3.92946,
+  "data/models/ships/vorcha/vorcha.nif": 3.2368,
+  "data/models/ships/warbird/warbird.nif": 7.54834
+ },
+ "source": "stbc.exe ShipClass.GetRadius, stbc-oracle catalogues"
+}

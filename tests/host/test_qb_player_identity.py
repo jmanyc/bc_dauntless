@@ -250,7 +250,8 @@ def test_battle_ships_and_player_have_radius_when_placement_runs(qb, monkeypatch
 
     def _spy(qb_, ship, pos, lateral, placed):
         player = App.Game_GetCurrentGame().GetPlayer()
-        seen.append((ship.GetName(), ship.GetRadius(), player.GetRadius()))
+        seen.append((ship.GetName(), ship.GetRadius(), player.GetRadius(),
+                     hl._bc_measured_radius(ship), hl._bc_measured_radius(player)))
         return orig_place(qb_, ship, pos, lateral, placed)
 
     monkeypatch.setattr(spawn, "_place", _spy)
@@ -260,12 +261,14 @@ def test_battle_ships_and_player_have_radius_when_placement_runs(qb, monkeypatch
     App.g_kTimerManager.tick(3.0)
     hl._fire_pending_preload_done()
     assert seen, "placement never ran"
-    # Fake renderer's unit-box AABB -> the same radius realisation would seed.
-    expected = hl._model_extent_from_aabb((0.0, 0.0, 0.0), (1.0, 1.0, 1.0)) \
+    # The radius realisation would seed: the original's measured value for a
+    # stock model (host_loop._bc_measured_radius), else the fake renderer's
+    # unit-box AABB through the mesh rule.
+    extent = hl._model_extent_from_aabb((0.0, 0.0, 0.0), (1.0, 1.0, 1.0)) \
         * hl.BC_MODEL_SCALE
-    for name, r, player_r in seen:
-        assert r == pytest.approx(expected), name
-        assert player_r == pytest.approx(expected), name
+    for name, r, player_r, measured, player_measured in seen:
+        assert r == pytest.approx(measured or extent), name
+        assert player_r == pytest.approx(player_measured or extent), name
 
 
 def test_radius_seeder_reuses_the_realisation_model_handle(qb, monkeypatch):

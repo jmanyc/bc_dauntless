@@ -26,14 +26,14 @@ import pytest
 
 from engine.core.loop import TICK_DELTA
 
-# `GetRadius()` as the oracle read it off the running exe (bible §12.1a meta
-# `player_radius` / `target radius`).  Others are estimates for collision only.
+# `GetRadius()` as the original game reports it (stbc-oracle, OracleTelemetry meta tele_X_radius, read on
+# the GOG exe 2026-10-17 for all 14 stock classes; Galaxy and Kessok Heavy also match bible §12.1a). The
+# AI's range checks use it (ConditionInRange's sphere is fDistance + target radius), and collisions.
+# Before 2026-10-17 only five were measured and the rest defaulted to 4.0 (Galor is 1.85).
 BIBLE_RADII_GU = {
-    "Galaxy": 4.366,
-    "KessokHeavy": 6.174,
-    "Sovereign": 4.5,
-    "BirdOfPrey": 2.0,
-    "Warbird": 8.0,
+    "Galaxy": 4.3665, "Sovereign": 3.9295, "Akira": 2.7568, "Nebula": 3.2013, "Ambassador": 3.3439,
+    "BirdOfPrey": 1.3488, "CardHybrid": 4.5970, "Galor": 1.8502, "Keldon": 2.4849, "KessokHeavy": 6.1742,
+    "KessokLight": 2.6195, "Marauder": 2.5753, "Vorcha": 3.2368, "Warbird": 7.5483,
 }
 
 TICKS_PER_SECOND = int(round(1.0 / TICK_DELTA))
