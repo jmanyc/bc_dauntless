@@ -20,9 +20,10 @@ Evidence tiers:
       object" (ConditionIncomingTorps.py:3-5), seeded from the named source
       (:148-151), and Defense.py:34 passes the ship's attack target as it.
     - param5 = (self.sFiringObject is not None): "is the source filter armed".
-    - the metric is a closing-TIME threshold in seconds (18.0 here, 3600.0 in
-      PlainAI/EvadeTorps): SDK EvadeTorps.UpdateTorpInfo:113-120 computes
-      distance / closing-speed downstream.
+    - the threshold is in seconds (18.0 here, 3600.0 in PlainAI/EvadeTorps);
+      the rule itself is cleanroom/spec/04_TorpIsIncoming.md (distance over
+      the torpedo's own speed, aimed at the observer, in its set) -- see
+      tests/unit/test_torp_is_incoming_rule.py.
     - armed-but-unresolved source (id == NULL_ID, match == 1) reports NOTHING:
       SetupInitialState:162 declines to count torps in exactly that case.
 """
@@ -63,14 +64,16 @@ def _ship(x=0.0, y=0.0, z=0.0):
     return s
 
 
-def _torp(pos, vel, source=None):
-    """A registered in-flight torpedo at `pos` travelling `vel`. A torpedo
-    joins its source's set at launch; a sourceless one is placed in the
-    shared set by hand."""
+def _torp(pos, vel, source=None, target=None):
+    """A registered in-flight torpedo at `pos` travelling `vel`, aimed at
+    `target` (only a torpedo aimed at the observer is ever incoming on it,
+    cleanroom/spec/04_TorpIsIncoming.md rule 3). A torpedo joins its source's
+    set at launch; a sourceless one is placed in the shared set by hand."""
     t = projectiles.Torpedo()
     t.SetTranslateXYZ(*pos)
     t._velocity = TGPoint3(*vel)
     t._source_ship = source
+    t._target_ship = target
     projectiles.register(t)
     if t.GetContainingSet() is None:
         _space.AddObjectToSet(t, f"Torp{t._id}")
@@ -82,7 +85,7 @@ def _torp(pos, vel, source=None):
 def test_torp_is_incoming_accepts_five_args_and_reports_a_closing_torp():
     ship = _ship(0, 0, 0)
     # 100 GU dead ahead on +Y, closing at 50 GU/s -> ETA 2s, well under 18.
-    torp = _torp((0, 100, 0), (0, -50, 0))
+    torp = _torp((0, 100, 0), (0, -50, 0), target=ship)
     # The exact call ConditionIncomingTorps.CheckTorpedo makes (5 args).
     result = App.AIScriptAssist_TorpIsIncoming(ship, torp, 18.0, NULL_ID, 0)
     assert result == 1
@@ -90,14 +93,14 @@ def test_torp_is_incoming_accepts_five_args_and_reports_a_closing_torp():
 
 def test_torp_is_incoming_receding_torp_reports_zero():
     ship = _ship(0, 0, 0)
-    torp = _torp((0, 100, 0), (0, 50, 0))  # moving AWAY on +Y
+    torp = _torp((0, 100, 0), (0, 50, 0), target=ship)  # moving AWAY on +Y
     assert App.AIScriptAssist_TorpIsIncoming(ship, torp, 18.0, NULL_ID, 0) == 0
 
 
 def test_torp_is_incoming_closing_but_beyond_time_threshold_reports_zero():
     ship = _ship(0, 0, 0)
     # Closing at 10 GU/s from 1000 GU out -> ETA 100s, over the 18s threshold.
-    torp = _torp((0, 1000, 0), (0, -10, 0))
+    torp = _torp((0, 1000, 0), (0, -10, 0), target=ship)
     assert App.AIScriptAssist_TorpIsIncoming(ship, torp, 18.0, NULL_ID, 0) == 0
 
 
@@ -111,9 +114,9 @@ def test_torp_is_incoming_rejects_non_torpedo():
 
 def test_get_incoming_ids_lists_only_closing_torps_by_objid():
     ship = _ship(0, 0, 0)
-    incoming = _torp((0, 100, 0), (0, -50, 0))     # ETA 2s -> incoming
-    receding = _torp((0, 100, 0), (0, 50, 0))      # away -> not
-    far = _torp((0, 1000, 0), (0, -10, 0))         # ETA 100s -> not
+    incoming = _torp((0, 100, 0), (0, -50, 0), target=ship)  # ETA 2s -> incoming
+    receding = _torp((0, 100, 0), (0, 50, 0), target=ship)   # away -> not
+    far = _torp((0, 1000, 0), (0, -10, 0), target=ship)      # ETA 100s -> not
 
     ids = App.AIScriptAssist_GetIncomingTorpIDsInSet(
         ship, ship.GetContainingSet(), 18.0, NULL_ID, 0)
@@ -127,8 +130,9 @@ def test_get_incoming_ids_returns_iterable_of_ints():
     # SDK does `for idTorp in lIncomingTorpIDs` and dict-keys them, so the
     # result must be a concrete iterable of ints (a _Stub loops forever).
     ship = _ship(0, 0, 0)
-    _torp((0, 100, 0), (0, -50, 0))
+    _torp((0, 100, 0), (0, -50, 0), target=ship)
     ids = App.AIScriptAssist_GetIncomingTorpIDsInSet(ship, None, 18.0, NULL_ID, 0)
+    assert ids
     assert list(ids) == [i for i in ids]
     assert all(isinstance(i, int) for i in ids)
 
@@ -140,7 +144,7 @@ def test_get_incoming_ids_returns_a_mutable_list():
     # torpedo entering the set (swallowed by the event dispatcher), so the
     # condition never tracked torps that spawned after SetupInitialState.
     ship = _ship(0, 0, 0)
-    _torp((0, 100, 0), (0, -50, 0))
+    _torp((0, 100, 0), (0, -50, 0), target=ship)
     ids = App.AIScriptAssist_GetIncomingTorpIDsInSet(ship, None, 18.0, NULL_ID, 0)
     ids.append(999)
     ids.remove(999)
@@ -153,8 +157,8 @@ def test_source_filter_matches_only_the_named_firing_object():
     ship = _ship(0, 0, 0)
     attacker = _ship(0, 500, 0)
     bystander = _ship(500, 0, 0)
-    from_attacker = _torp((0, 100, 0), (0, -50, 0), source=attacker)
-    from_bystander = _torp((50, 0, 0), (-50, 0, 0), source=bystander)
+    from_attacker = _torp((0, 100, 0), (0, -50, 0), source=attacker, target=ship)
+    from_bystander = _torp((50, 0, 0), (-50, 0, 0), source=bystander, target=ship)
 
     ids = App.AIScriptAssist_GetIncomingTorpIDsInSet(
         ship, None, 18.0, attacker.GetObjID(), 1)
@@ -169,7 +173,7 @@ def test_source_filter_armed_but_unresolved_id_matches_nothing():
     # exactly this case, so we report nothing.
     ship = _ship(0, 0, 0)
     attacker = _ship(0, 500, 0)
-    _torp((0, 100, 0), (0, -50, 0), source=attacker)  # a real, closing torp
+    _torp((0, 100, 0), (0, -50, 0), source=attacker, target=ship)  # a real, closing torp
     ids = App.AIScriptAssist_GetIncomingTorpIDsInSet(ship, None, 18.0, NULL_ID, 1)
     assert list(ids) == []
 
@@ -227,7 +231,7 @@ def test_a_torpedo_in_another_frame_is_never_incoming():
         qb.AddObjectToSet(shooter, "Shooter")
         # At the observer's numeric position+100 on +Y, closing at 50 GU/s:
         # ETA 2 s by raw numbers -- but QuickBattle is its own frame.
-        torp = _torp((0, 100, 0), (0, -50, 0), source=shooter)
+        torp = _torp((0, 100, 0), (0, -50, 0), source=shooter, target=observer)
         assert torp.GetContainingSet() is qb
         assert projectiles.is_incoming(observer, torp, 100.0, None, False) is False
     finally:

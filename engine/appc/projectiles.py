@@ -344,65 +344,34 @@ _ZERO_OFFSET = (0.0, 0.0, 0.0)
 
 # ── Incoming-torpedo detection (AIScriptAssist_* backing) ─────────────────────
 # Backs the two AIScriptAssist entry points the SDK torpedo-evasion code calls
-# (App.AIScriptAssist_TorpIsIncoming / _GetIncomingTorpIDsInSet). The RE'd
-# symbol table gives their SIGNATURES but no body:
-#   0x006063d0  TorpIsIncoming(PyObject*, float, long, int)  argfmt 'OOfli'
-#   0x00473830  GetIncomingTorpIDsInSet(PyObject*, float, int, int)  'OOfii'
-# so the metric below is derived from the SDK, not read off the binary --
-# flagged inline where it is inference.
-
-def _closing_time(observer, torp):
-    """Estimated seconds until `torp` reaches `observer`, or None if it is not
-    closing (moving away / parallel).
-
-    INFERENCE (not from the binary): the caller passes a threshold named
-    ``fDangerTimeThreshold`` in SECONDS (18.0 in ConditionIncomingTorps,
-    3600.0 in PlainAI/EvadeTorps), and the SDK computes exactly this quantity
-    downstream -- ``fIncomingSpeed = -relVel . dirToTorp; t = distance /
-    fIncomingSpeed`` (AI/PlainAI/EvadeTorps.py:113-120). We reproduce that
-    closing-time. The exact formula BC's engine used is unknown; this is the
-    only dimensionally-consistent reading of a 'danger *time*' from the
-    position + velocity state both entry points are handed.
-
-    The torpedo is read in the OBSERVER's set-local coordinates
-    (frames.local_in): a torpedo in another region of the same star system
-    is measured at its system position, and one in another frame -- or an
-    observer or torpedo in no set -- is never closing (None). Velocities are
-    directions and take no offset."""
-    from engine.systems import frames
-    p = frames.local_in(frames.containing_set(observer), torp)
-    if p is None:
-        return None
-    o = observer.GetWorldLocation()
-    d = TGPoint3(p[0] - o.x, p[1] - o.y, p[2] - o.z)
-    dist = d.Length()
-    if dist < 1e-6:
-        return 0.0                       # already on top of us
-    rel = torp.GetVelocityTG()
-    ov = observer.GetVelocityTG()
-    rel = TGPoint3(rel.x - ov.x, rel.y - ov.y, rel.z - ov.z)
-    inv = 1.0 / dist
-    to_torp = TGPoint3(d.x * inv, d.y * inv, d.z * inv)
-    closing = -rel.Dot(to_torp)          # >0 iff the torp is approaching
-    if closing <= 1e-6:
-        return None
-    return dist / closing
+# (App.AIScriptAssist_TorpIsIncoming / _GetIncomingTorpIDsInSet, the latter
+# asking the former about every torpedo in the set). Five arguments: the
+# observing ship, a torpedo (or set), a danger threshold in seconds, a firing
+# object id and whether that source filter is armed.
+#
+# The rule (cleanroom/spec/04_TorpIsIncoming.md):
+#   1. source filter armed -> the torpedo's firing object must be the given one;
+#   2. the torpedo is in the observing ship's set;
+#   3. the torpedo's TARGET is the observing ship -- a torpedo aimed at someone
+#      else, an unguided one, or the ship's own never counts, however it flies;
+#   4. it moves toward the ship: (torpedo pos - ship pos) . torpedo velocity <= 0;
+#   5. distance / the torpedo's OWN speed (not a closing speed) < threshold.
+#
+# The earlier SDK-inferred rule (any projectile with a positive closing speed)
+# made ConditionIncomingTorps flicker on pulse bolts, stray torpedoes and the
+# ship's own launches: a Vor'cha's IncomingTorps went true 5.96 times a minute
+# for a median 0.5 s against 1.76 times a minute for 5.0 s in the original,
+# and every flicker re-armed CloakAttack's 15 s timer.
 
 
 def _matches_source(torp, firing_object_id, match_source) -> bool:
-    """Firing-object match filter (param 4 / param 5).
+    """Rule 1, the firing-object filter (param 4 / param 5).
 
     param 5 (``match_source``) = "is the source filter armed"
-    (== ``self.sFiringObject is not None``). When it is NOT armed, every torp
-    passes. When it IS armed, only torps fired by the object whose id is
-    ``firing_object_id`` pass -- the module is "True if a given object has
-    incoming torps FROM the specified firing object"
-    (ConditionIncomingTorps.py:3-5), and Defense.py:34 passes the ship's
-    attack target as that source.
-
-    An armed filter with an unresolved id (== NULL_ID -- a named source that
-    has not spawned yet, ConditionIncomingTorps.py:84) matches nothing:
-    SetupInitialState:162 declines to count torps in exactly that case."""
+    (== ``self.sFiringObject is not None``). Unarmed, every torpedo passes.
+    Armed, only torpedoes fired by the object whose id is
+    ``firing_object_id`` pass. An armed filter with an unresolved id
+    (NULL_ID -- a named source that has not spawned yet) matches nothing."""
     if not match_source:
         return True
     src = torp._source_ship
@@ -413,28 +382,41 @@ def _matches_source(torp, firing_object_id, match_source) -> bool:
 
 def is_incoming(observer, torp, danger_threshold, firing_object_id,
                 match_source) -> bool:
-    """True iff `torp` passes the source filter AND will reach `observer`
-    within `danger_threshold` seconds. Backs AIScriptAssist_TorpIsIncoming."""
-    if not isinstance(torp, Torpedo):
+    """True iff `torp` counts as incoming on `observer` (rules 1-5 above).
+    Backs AIScriptAssist_TorpIsIncoming."""
+    if not isinstance(torp, Torpedo) or observer is None:
         return False
     if not _matches_source(torp, firing_object_id, match_source):
         return False
-    t = _closing_time(observer, torp)
-    return t is not None and t <= danger_threshold
+    from engine.systems import frames
+    ship_set = frames.containing_set(observer)
+    if ship_set is None or frames.containing_set(torp) is not ship_set:
+        return False
+    if torp._target_ship is not observer:
+        return False
+    tp = torp.GetWorldLocation()
+    sp = observer.GetWorldLocation()
+    dx, dy, dz = tp.x - sp.x, tp.y - sp.y, tp.z - sp.z
+    v = torp.GetVelocityTG()
+    if dx * v.x + dy * v.y + dz * v.z > 0.0:
+        return False
+    speed = (v.x * v.x + v.y * v.y + v.z * v.z) ** 0.5
+    if speed <= 0.0:
+        return False
+    dist = (dx * dx + dy * dy + dz * dz) ** 0.5
+    return dist / speed < danger_threshold
 
 
-def incoming_ids(observer, danger_threshold, firing_object_id, match_source):
-    """Object ids of every in-flight torpedo incoming on `observer`, applying
-    the source filter. Backs AIScriptAssist_GetIncomingTorpIDsInSet.
-
-    Scope note: BC scopes this to the ship's containing SetClass. Torpedoes
-    join their source's set at launch (_join_source_set), and _closing_time
-    returns None across frames, so iterating _active directly is safe: a
-    torpedo in another frame is never incoming, and one in another region of
-    the same star system is judged at its system position."""
+def incoming_ids(observer, danger_threshold, firing_object_id, match_source,
+                 pSet=None):
+    """Object ids of every in-flight torpedo in `pSet` that is_incoming on
+    `observer`. Backs AIScriptAssist_GetIncomingTorpIDsInSet. With no set
+    given every live torpedo is asked (rule 2 still confines the answer to
+    the observer's own set)."""
     return [t.GetObjID() for t in list(_active)
-            if is_incoming(observer, t, danger_threshold, firing_object_id,
-                           match_source)]
+            if (pSet is None or t.GetContainingSet() is pSet)
+            and is_incoming(observer, t, danger_threshold, firing_object_id,
+                            match_source)]
 
 
 def update_all(dt: float, all_ships, *, ship_instances=None) -> list[tuple]:

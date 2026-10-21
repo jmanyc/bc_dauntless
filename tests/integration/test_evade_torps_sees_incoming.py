@@ -53,6 +53,7 @@ def test_evade_torps_records_incoming_torpedo():
     torp = projectiles.Torpedo()
     torp.SetTranslateXYZ(0, 100, 0)
     torp._velocity = TGPoint3(0, -50, 0)
+    torp._target_ship = ship               # only a torpedo aimed at us is incoming
     projectiles.register(torp)
     # Sourceless, so it joined no set at launch; an object in no set is never
     # incoming on anything (system-frames), so place it in the ship's set.

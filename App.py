@@ -856,9 +856,9 @@ class FuzzyLogic:
 #    TypeError on every ConditionIncomingTorps call (swallowed by the event
 #    dispatcher), so no NPC ever evaded.
 #
-# Parameter MEANINGS and the closing-time metric are derived from the SDK
-# call sites; the derivation (and what is inference vs. grounded) lives with
-# the implementation in engine/appc/projectiles.py. `bMatchFiringObject` is
+# The incoming rule (source filter, same set, the torpedo's target is the
+# ship, moving toward it, distance / own speed under the threshold) lives
+# with the implementation in engine/appc/projectiles.py. `bMatchFiringObject` is
 # the SDK's `(self.sFiringObject is not None)` -- whether the source filter is
 # armed -- so it is truthiness-tested, not int-coerced.
 
@@ -868,7 +868,8 @@ def AIScriptAssist_GetIncomingTorpIDsInSet(pShip, pSet, fDangerTimeThreshold,
     # Must be a fresh LIST: ConditionIncomingTorps.py:166 keeps the return
     # value as self.liIncoming and .append()s/.remove()s on it (:270, :278).
     return list(incoming_ids(pShip, float(fDangerTimeThreshold),
-                             int(iFiringObjectID), bool(bMatchFiringObject)))
+                             int(iFiringObjectID), bool(bMatchFiringObject),
+                             pSet))
 
 
 def AIScriptAssist_TorpIsIncoming(pShip, pTorp, fDangerTimeThreshold,
