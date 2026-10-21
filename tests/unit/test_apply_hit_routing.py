@@ -95,8 +95,11 @@ def test_splash_hit_at_subsystem_centre_damages_it():
     apply_hit(ship, 500.0, TGPoint3(0, 5, 0), source=None)
     # Bridge should be destroyed (took full 400, capped at max 300).
     assert bridge.GetCondition() == 0.0
-    # Hull takes full post-shield damage: 1000 - 400 = 600.
-    assert hull.GetCondition() == 600.0
+    # Hull takes full post-shield damage (400) PLUS the bridge's 100 overflow,
+    # re-applied as a follow-up hit (stbc-oracle reference §1: a 900 quantum
+    # that destroyed 2 tubes and a pod was followed by a 685 hull hit, the
+    # exact excess): 1000 - 400 - 100 = 500.
+    assert hull.GetCondition() == 500.0
 
 
 def test_hull_zero_marks_ship_dying():

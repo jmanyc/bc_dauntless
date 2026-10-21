@@ -14,6 +14,7 @@ bottom of subsystems.py guarantees the normal load order).
 """
 
 import math as _math
+import struct
 
 from engine.core import ids
 from engine.appc.math import TGPoint3, TGMatrix3
@@ -343,10 +344,22 @@ PULSE_DAMAGE_SCALE_BY_POWER_SETTING = (0.2, 0.5, 1.0)   # LOW, MED, HIGH
 #     four Kessok beams, 7 charge at 1.0/s → 800/s × (7.5 − 0.66) s ≈ 5 470.
 #
 # The threshold is tested against the dwell banked BEFORE this frame, and the
-# flush includes this frame's dt, so a pulse carries 32 ticks of dwell
-# (0.533 at 60 Hz, quantum 106.7) — what the rows show — not 31.
+# flush includes this frame's dt. The dwell is a 32-BIT FLOAT on stbc.exe, and
+# 30 x float32(1/60) rounds to just above 0.5, so on the native game the
+# threshold passes after 30 frames and a pulse carries 31 ticks of dwell
+# (0.5167 s at 60 Hz, Kessok quantum 103.33, one pulse every 31 frames).
+# Measured on native Windows (stbc-oracle results_win/duels_ai_matrix,
+# 2026-10-17: 2,367 Kessok forward-beam hits of exactly 103.3, spaced 0.517 s).
+# The older 32-tick figure (106.25-106.7, 0.53 s) was measured under CrossOver,
+# whose x87 runs in DOUBLE precision (control word 0x027F vs native 0x007F):
+# in doubles 30 x (1/60) falls just short of 0.5 and a 32nd frame is needed.
 BEAM_ON_DELAY_S = 2 * 0.33
 BEAM_DWELL_FLUSH_S = 0.5
+
+
+def _f32(x: float) -> float:
+    """Round to IEEE single precision, as the original stores the beam dwell."""
+    return struct.unpack("f", struct.pack("f", x))[0]
 
 # Default PowerSetting.  ASSUMED, not RE'd: the SDK never calls
 # EnergyWeapon.SetPowerSetting (zero call sites) and the constructor value
@@ -545,13 +558,13 @@ def _solve_pulse_launch_direction(cannon, ship, target, mod):
     return TGPoint3(launch.x / n, launch.y / n, launch.z / n)
 
 
-def _spawn_projectile(emitter, mod, *, drf_override=0.0, world_dir=None):
+def _spawn_projectile(emitter, mod, *, world_dir=None):
     """Spawn an in-flight projectile from `emitter` using SDK module `mod`.
 
     Shared by torpedo tubes and pulse-weapon cannons. Builds a Torpedo at the
-    emitter's world position, runs mod.Create to populate visuals/behaviour,
-    applies drf_override (the launcher's DamageRadiusFactor) when > 0, and
-    launches it at GetLaunchSpeed() plus the firing ship's own linear
+    emitter's world position, runs mod.Create to populate visuals/behaviour
+    (including the payload's DamageRadiusFactor, which the projectile keeps),
+    and launches it at GetLaunchSpeed() plus the firing ship's own linear
     velocity.  The launch DIRECTION differs by weapon class, and the caller
     owns that choice:
 
@@ -577,14 +590,12 @@ def _spawn_projectile(emitter, mod, *, drf_override=0.0, world_dir=None):
 
     mod.Create(torp)
 
-    # §3.2 DRF override: if the launching tube has a non-zero
-    # DamageRadiusFactor (set by the hardpoint script, e.g.
-    # galaxy.py ForwardTorpedo1.SetDamageRadiusFactor(0.20)),
-    # it overrides the payload value set by mod.Create above.
-    # host_loop passes the torpedo as hardpoint_weapon to apply_hit,
-    # so torp._damage_radius_factor must carry the launcher value.
-    if drf_override > 0.0:
-        torp._damage_radius_factor = drf_override
+    # The projectile keeps the payload's DamageRadiusFactor from mod.Create; the
+    # launcher's hardpoint value is never used. Measured on stbc.exe (CombatTap
+    # H rad, 7 duels): every torpedo and cannon bolt hit carries its payload's
+    # value (photon 0.13, quantum 0.14, disruptor 0.15, Romulan 0.2) and never
+    # the tubes' or cannons' 0.2 / 0.3 / 0.6. The old launcher override gave
+    # the Akira's quantums a 0.6 sphere (dn_human_1).
 
     launch_speed = float(mod.GetLaunchSpeed()) if hasattr(mod, "GetLaunchSpeed") else 0.0
 
@@ -775,7 +786,8 @@ class _EnergyWeaponFireMixin:
         # (ShipSubsystem field, sane 0.25 default) so this never raises even
         # on a bank with no property bound.
         combined = self.GetConditionPercentage() * parent.GetConditionPercentage()
-        if self.GetDisabledPercentage() >= combined:
+        # Strict, like IsDisabled: on stbc.exe a bank at exactly 75% still fires.
+        if combined < self.GetDisabledPercentage():
             return 0
         return 1
 
@@ -835,9 +847,9 @@ class _EnergyWeaponFireMixin:
         if not self.IsBeamOn():
             return 0.0
         if self._dwell > BEAM_DWELL_FLUSH_S:
-            flushed, self._dwell = self._dwell + dt, 0.0   # the flush frame counts
+            flushed, self._dwell = _f32(self._dwell + _f32(dt)), 0.0   # the flush frame counts
             return flushed
-        self._dwell += dt
+        self._dwell = _f32(self._dwell + _f32(dt))         # 32-bit float, as on stbc.exe
         return 0.0
 
     def take_dwell(self) -> float:
@@ -2773,8 +2785,7 @@ class PulseWeapon(_EnergyWeaponFireMixin, WeaponSystem):
             self._target = None
             self._target_offset = None
             world_dir = _emitter_forward_world(self, ship)
-        torp = _spawn_projectile(self, mod, drf_override=self.GetDamageRadiusFactor(),
-                                 world_dir=world_dir)
+        torp = _spawn_projectile(self, mod, world_dir=world_dir)
         if torp is not None:
             # The bolt carries script GetDamage() × GetDamageScale() —
             # 0x00576080 scales it at spawn (PulseWeaponDamage.md C1).
@@ -3339,8 +3350,7 @@ class TorpedoTube(Weapon):
         if mod is None:
             return
 
-        torp = _spawn_projectile(self, mod,
-                                 drf_override=self.GetDamageRadiusFactor())
+        torp = _spawn_projectile(self, mod)
         # ET_TORPEDO_FIRED carries the PROJECTILE as its source, so it can only be
         # posted once the projectile exists.  Posted here rather than inside
         # _spawn_projectile because that helper is shared with pulse cannons, and

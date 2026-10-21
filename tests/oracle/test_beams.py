@@ -107,9 +107,14 @@ def test_b6_windup_before_first_quantum(oracle):
 
 
 def test_b7_damage_arrives_as_quanta(oracle):
-    """B7 — `phaser_high_front_57`: after the windup, the face steps down in
-    discrete quanta of 106.25 (±2 %) with ~0.35 s of nothing between volleys;
-    on a per-tick model most ticks carry a fraction of a quantum."""
+    """B7 — after the windup, the face steps down in discrete quanta with
+    nothing between volleys; on a per-tick model most ticks carry a fraction
+    of a quantum. The quantum is 400 × 0.5 × 31/60 = 103.33: measured on the
+    NATIVE game (stbc-oracle results_win/duels_ai_matrix, 2026-10-17: 2,367
+    Kessok forward-beam hits of exactly 103.3, one per bank every 0.517 s),
+    where the beam dwell is a 32-bit float and 30 frames already exceed 0.5 s.
+    `phaser_high_front_57` measured 106.25 (32 frames) under CrossOver, whose
+    x87 runs in double precision — not the game as shipped."""
     s = oracle(attacker="KessokHeavy", range_gu=57)
     s.fire("phaser", intensity=HIGH)
     s.run(1.2)                      # past the windup
@@ -121,7 +126,7 @@ def test_b7_damage_arrives_as_quanta(oracle):
             steps.append(prev - cur)
         prev = cur
     assert steps, "no damage steps sampled"
-    quantum = MAX_DAMAGE * 0.5 * 0.53125
+    quantum = MAX_DAMAGE * 0.5 * 31.0 / 60.0
     # Every step is one or more whole quanta (beams stagger 1–4 ticks, so a
     # tick may carry two).
     for d in steps:

@@ -1157,7 +1157,10 @@ class ShipSubsystem(TGEventHandlerObject):
         if self._max_condition <= 0.0:
             return 0
         threshold = self._disabled_percentage * self._max_condition
-        return 1 if self._condition <= threshold else 0
+        # Strict: on stbc.exe a subsystem at exactly its threshold still works
+        # (75.0% works, 74.9% is disabled; sensor 50.0% / 49.9% likewise), and a
+        # pod at exactly 50% still contributes 0.5 (stbc-oracle reference §3, §5.2).
+        return 1 if self._condition < threshold else 0
 
     def IsDamaged(self) -> int:
         """Returns 1 if the subsystem has taken any damage (condition below

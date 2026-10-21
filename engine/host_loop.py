@@ -852,6 +852,16 @@ def _phaser_damage_for_tick(max_damage: float,
     return max_damage * (max_damage_distance / dist) * dt   # R/d beyond
 
 
+def _bank_condition_factor(bank) -> float:
+    """Phaser damage scales with the firing bank's condition fraction
+    (measured on stbc.exe: 133.4 -> 120.7 -> 106.5 per s at 100/90/80%)."""
+    try:
+        f = float(bank.GetConditionPercentage())
+    except Exception:
+        return 1.0
+    return max(0.0, min(1.0, f))
+
+
 def _pump_held_weapons(ships_list, dt: float) -> None:
     """BC WeaponSystem tick (weapon-firing-mechanics.md §3.2): one
     update_weapons per ARMED system per frame.  Replaces the per-class
@@ -1113,20 +1123,22 @@ def _advance_combat(ships, dt: float, ship_instances=None,
                             max_damage=bank.GetMaxDamage(),
                             max_damage_distance=bank.GetMaxDamageDistance(),
                             dist=dist, dt=dt,
-                        ) * PHASER_INTENSITY_SCALE[level],
+                        ) * PHASER_INTENSITY_SCALE[level] * _bank_condition_factor(bank),
                         ship_instances=ship_instances,
                         weapon_type="phaser",
                         radius=combat.weapon_splash_radius(bank, None),
                     )
                     continue
                 # One pulse: MaxDamage × intensity × distance factor × dwell
-                # (clean-room 0x00572A50; measured stbc-oracle bible §2.2).
+                # (clean-room 0x00572A50; measured stbc-oracle bible §2.2)
+                # × the bank's own condition: on stbc.exe a bank at 90% / 80%
+                # did 0.90 / 0.80 of full damage (stbc-oracle reference §1.5).
                 damage = _phaser_damage_for_tick(
                     max_damage=bank.GetMaxDamage(),
                     max_damage_distance=bank.GetMaxDamageDistance(),
                     dist=dist,
                     dt=flush_dwell,
-                ) * PHASER_INTENSITY_SCALE[level]
+                ) * PHASER_INTENSITY_SCALE[level] * _bank_condition_factor(bank)
                 if damage > 0:
                     # LIGHT (PP_LOW) phaser power is "disable, don't destroy":
                     # damage routes to subsystems only, the hull takes no condition
