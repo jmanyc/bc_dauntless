@@ -11829,6 +11829,13 @@ def run(mission_name: Optional[str] = None,
                     from engine.systems import handoff
                     handoff.tick(player)
 
+                # Human-play combat recorder (engine/combat_recorder.py): off unless
+                # DAUNTLESS_COMBAT_RECORD=<folder>; samples the player's fight after
+                # this frame's combat and collisions.
+                from engine import combat_recorder
+                if combat_recorder.ENABLED:
+                    combat_recorder.tick(player)
+
                 # The scene reconcile (_reconcile_scene): load the player's
                 # system, realize / tear down / cull / hide ships for the
                 # render scope, and diff the viewed frame's map bodies. It
