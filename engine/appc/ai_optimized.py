@@ -25,6 +25,9 @@ an entry here, for two different reasons:
   FleeAttackOrFollow), so running the Python body would delete every Federation
   ship's AI within one 3-second cadence. The ``SetInterruptable(1)`` bypass
   cannot save it: ``FleeAttackOrFollow`` sets that flag itself.
+* ``FireScript`` runs the compiled node in engine/appc/optimized_fire_script.py
+  (cleanroom/spec/01_FireScript_compiled.md), mixed in ahead of the SDK class
+  inside the same non-lethal wrapper as below.
 * ``FireScript`` and ``AvoidObstacles`` get NON-LETHAL WRAPPERS. Their SDK Python
   bodies are full working implementations that we NEED and run verbatim — but
   each has one edge that returns PS_DONE:
@@ -493,9 +496,17 @@ def _non_lethal_class(base: type) -> type:
     # functools.wraps, so the driver's inspect.signature() arity probe
     # (ai_driver._tick_preprocessing) still sees the SDK's (self, dEndTime) and
     # passes the end time through.
+    # FireScript runs the compiled node (CompiledFireScriptMixin, ahead of the
+    # SDK class in the bases below); every other class runs its SDK body.
+    if base.__name__ == "FireScript":
+        from engine.appc.optimized_fire_script import CompiledFireScriptMixin
+        inner_update = CompiledFireScriptMixin.Update
+    else:
+        inner_update = base.Update
+
     @functools.wraps(base.Update)
     def Update(self, *args, **kwargs):
-        result = base.Update(self, *args, **kwargs)
+        result = inner_update(self, *args, **kwargs)
         if result == App.PreprocessingAI.PS_DONE:
             # *** THE DIVERGENCE. *** The shipped engine never ran this Python
             # body — it ran a native class whose no-target/no-ship return value
@@ -554,8 +565,14 @@ def _non_lethal_class(base: type) -> type:
         # the player's fire nodes by isinstance against that class — so the
         # wrapper must BE one. The SDK FireScript already defines every
         # method the binding lists (Preprocessors.py:172-230).
+        #
+        # The compiled node (cleanroom/spec/01_FireScript_compiled.md) is a
+        # mixin AHEAD of the SDK class: it overrides Update, GetNextUpdateTime,
+        # FireSystemAtTarget and ConfigureWeaponSystem and reuses every other
+        # SDK helper through the MRO.
         from engine.appc.ai import OptimizedFireScript
-        bases = (base, OptimizedFireScript)
+        from engine.appc.optimized_fire_script import CompiledFireScriptMixin
+        bases = (CompiledFireScriptMixin, base, OptimizedFireScript)
     cls = type(base.__name__ + "_NonLethal", bases, members)
     _NON_LETHAL_CLASSES[base] = cls
     # Register the dynamic class in the module globals so pickle can find it at
@@ -563,6 +580,16 @@ def _non_lethal_class(base: type) -> type:
     # the cache check above (we only create one class per base type).
     globals()[cls.__name__] = cls
     return cls
+
+
+def _compile_fire_script(instance):
+    """The FireScript binding: the compiled node over the SDK instance's
+    settings, non-lethal like every wrapped preprocessor. The node's own
+    state (accumulator, its clock, the aim/fire phase) starts at bind time."""
+    from engine.appc.optimized_fire_script import init_node_state
+    alias = _wrap_non_lethal(instance)
+    init_node_state(alias.__dict__)
+    return alias
 
 
 def _wrap_non_lethal(instance):
@@ -586,7 +613,7 @@ def _wrap_non_lethal(instance):
 # of object each one yields.
 OPTIMIZED_PREPROCESSORS: dict = {
     "ManagePower": _replace_manage_power,     # real replacement (SDK body is a stub)
-    "FireScript": _wrap_non_lethal,           # SDK body, PS_DONE de-fanged
+    "FireScript": _compile_fire_script,       # compiled node, PS_DONE de-fanged
     # SDK scan, PS_DONE de-fanged, plus the phase offset and evading cadence.
     # This entry has always done TWO jobs and only one of them was the problem:
     # the engine scan (removed below, opt-in) and protection against

@@ -46,16 +46,19 @@ def test_other_preprocessors_are_not_optimized_fire_scripts():
 
 
 def test_fire_script_non_lethal_mro_is_trivial():
-    """MRO sanity: the dynamic wrapper class sits in front of (SDK FireScript,
-    OptimizedFireScript) with no diamond and no surprise resolution order --
-    guards against a future refactor of `_non_lethal_class`'s `bases` tuple."""
+    """MRO sanity: the dynamic wrapper class sits in front of (the compiled
+    node's mixin, SDK FireScript, OptimizedFireScript) with no diamond and no
+    surprise resolution order -- guards against a future refactor of
+    `_non_lethal_class`'s `bases` tuple. The mixin must come BEFORE the SDK
+    class so its Update / FireSystemAtTarget / ConfigureWeaponSystem win."""
     import AI.Preprocessors
     ship = ShipClass(); ship._hull = HullSubsystem("H"); ship._hull.SetMaxCondition(1000.0)
     node = PreprocessingAI_Create(ship, "Fire")
     node.SetPreprocessingMethod(AI.Preprocessors.FireScript("X"), "Update")
     inst = node.GetPreprocessingInstance()
     assert [c.__name__ for c in type(inst).__mro__] == [
-        "FireScript_NonLethal", "FireScript", "OptimizedFireScript", "object",
+        "FireScript_NonLethal", "CompiledFireScriptMixin", "FireScript",
+        "OptimizedFireScript", "object",
     ]
 
 
