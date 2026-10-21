@@ -178,19 +178,13 @@ def test_c1_elastic_bounce(oracle, rammer, mass, v_impact, v_target_after, _dmg)
     assert s.speed_of(s.tgt) == pytest.approx(v_target_after, rel=0.03)
 
 
-@pytest.mark.parametrize("rammer, mass, v_impact, _v, damage", [
-    pytest.param(*RAMS[0], marks=bible_xfail(
-        "C2", "Kessok Heavy (mass 500) ramming a Galaxy deals 5870 ± 10 %",
-        "KE-based coefficient gives ~3300")),
-    RAMS[1],
-    pytest.param(*RAMS[2], marks=bible_xfail(
-        "C2", "Bird of Prey (mass 45) ramming a Galaxy deals 3527 ± 10 %",
-        "KE-based coefficient gives ~3100")),
-])
+@pytest.mark.parametrize("rammer, mass, v_impact, _v, damage", RAMS)
 def test_c2_ram_damage_is_8_2_times_impulse(oracle, rammer, mass, v_impact, _v, damage):
-    """C2 — `ram_*`: first-impact damage to the parked Galaxy = 8.2 × J with
-    J = 2μv (5870 / 6089 / 3527 ± 10 %).  Only the equal-mass Galaxy pairing
-    lands inside tolerance on today's KE-based coefficient."""
+    """C2 — `ram_*`: first-impact damage to the parked Galaxy (5870 / 6089 /
+    3527 ± 10 %). collisions.BC_RAM_*: 490 + 1800 x m_other / (m_a + m_b) x v
+    per ship, fit to these three plus the stbc-oracle Galaxy/Sovereign rams;
+    a ram's overflow is not re-applied (combat.apply_hit), so the hull loss
+    equals the impact amount."""
     s, first = _ram(oracle, rammer)
     assert first == pytest.approx(damage, rel=0.10)
 

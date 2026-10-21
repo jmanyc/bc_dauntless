@@ -70,7 +70,7 @@ def test_scuff_band_is_ship_sized_not_hull_sized():
 
 # ── impact ──────────────────────────────────────────────────────────────────
 
-def test_impact_hits_are_collision_typed_with_a_decal_radius_and_no_splash_radius(hits):
+def test_impact_hits_are_collision_typed_with_a_decal_radius_and_bc_ram_radius(hits):
     a = _ship(0.0, vx=2.0)
     b = _ship(1.5)                       # overlapping: reach = 2 * scale
     assert _respond(a, b) is not None, "fixture did not collide"
@@ -78,7 +78,10 @@ def test_impact_hits_are_collision_typed_with_a_decal_radius_and_no_splash_radiu
     for _ship_, _dmg, kw in hits:
         assert kw["weapon_type"] == "collision"
         assert collisions.SCUFF_RADIUS_MIN_GU <= kw["decal_radius"] <= collisions.SCUFF_RADIUS_MAX_GU
-        assert "splash_radius" not in kw, "the scuff size must not widen collision damage"
+        # A ship-to-ship ram damages everything within BC's measured 1.5 GU
+        # (stbc-oracle reference §11); the scuff size must still not set it.
+        assert kw.get("splash_radius") in (None, collisions.BC_RAM_RADIUS_GU), \
+            "the scuff size must not widen collision damage"
 
 
 def test_dead_on_impact_passes_no_tangent(hits):

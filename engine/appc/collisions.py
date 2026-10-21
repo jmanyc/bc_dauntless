@@ -23,6 +23,25 @@ COLLISION_DAMAGE_COEFF = 5.0     # KE -> hull-damage-points; calibrated against
                                  # full-impulse planet ram ~79% hull (near-fatal),
                                  # head-on both-full ram >100% (kill), dock-bump
                                  # trivial. Tune in-engine by feel. See spec §9.
+# BC ship-to-ship impact damage, per ship: BASE + K x that ship's share of
+# the closing speed, m_other / (m_a + m_b) x v (its velocity change in an
+# inelastic impact), shields bypassed, 1.5 GU damage radius. One K fits all
+# five original-exe rams (stbc-oracle bible §7.4: Kessok / Galaxy / Bird of
+# Prey into a parked Galaxy -> 1800 / 1804 / 1805; reference §11 Galaxy into
+# Sovereign -> Galaxy 1804, Sovereign 1815), so the lighter ship takes more.
+BC_RAM_BASE = 490.0
+BC_RAM_K = 1800.0
+BC_RAM_RADIUS_GU = 1.5
+# How far inside the visible hull a ram's damage footprint is centred, along
+# the line from the contact toward the ship's own centre. The original's
+# contact sits on its own collision shape: on the Sovereign's bow that is
+# 2.31 GU from the centre where the visible saucer edge is at 3.31 (stbc-oracle
+# coll_k*_a0: every system within r_sub + 1.5 of that deeper point -- sensor
+# array, bridge, 8 phaser banks, both forward tractors -- took the full
+# impact). From the skin the 1.5 GU reach caught only the sensor array and the
+# tractors. User's call (2026-10-16): centre the damage ~1 GU inside. Never
+# past the ship's centre. An approximation from one direction of one ship.
+BC_RAM_DAMAGE_DEPTH_GU = 1.0
 COLLISION_DECAY_TAU = 0.5        # collision-velocity overlay decay time constant (s)
 COLLISION_FALLBACK_MASS = 1.0e4  # nominal mass for a ship reporting GetMass()==0
 COLLISION_GRIND_COEFF = 2.5      # sustained-contact (abrasion) damage, in hull
@@ -879,6 +898,15 @@ def _respond_pair(a: "_Body", b: "_Body", ship_instances=None, dt: float = 0.0,
     # kinetic-impact AddDamage primitive, which skips shields.
     from engine.appc.combat import apply_hit
     damage = _ke_damage(inv_sum, v_rel)
+    ram = _is_ship_ram(a, b)
+    if ram:
+        # BC ship-to-ship impact (stbc-oracle reference §11): both ships take
+        # BC_RAM_BASE + BC_RAM_K x their share of the closing speed, shields
+        # bypassed (identical with shields up or down), over a 1.5 GU radius.
+        damage_a = BC_RAM_BASE + BC_RAM_K * (a.inv_mass / inv_sum) * abs(v_rel)
+        damage_b = BC_RAM_BASE + BC_RAM_K * (b.inv_mass / inv_sum) * abs(v_rel)
+    else:
+        damage_a = damage_b = damage
     # The shield flash (a shielded side only -- a bypassing side absorbs
     # nothing, so draws none) is ONE push: the single-impact seed, not the
     # per-tick one a phaser or a grind frame uses, with the splash reach
@@ -888,23 +916,56 @@ def _respond_pair(a: "_Body", b: "_Body", ship_instances=None, dt: float = 0.0,
     flash_r = r_small / SHIELD_SPLASH_REACH_PER_RADIUS
     n_ab = TGPoint3(nx, ny, nz)
     n_ba = TGPoint3(-nx, -ny, -nz)
+    ram_kw = dict(bypass_shields=True, shield_point=None, splash_radius=BC_RAM_RADIUS_GU) if ram else None
     if a.is_movable:
         pt_a, n_a = _trace_own_hull(ship_instances, a, boundary_a, n_ab, trace_reach)
-        apply_hit(a.obj, damage, pt_a, source=b.obj, normal=n_a,
+        kw = (dict(ram_kw, damage_point=_ram_damage_point(a.obj, pt_a)) if ram
+              else dict(bypass_shields=not shielded_a, shield_point=shield_pt_a))
+        apply_hit(a.obj, damage_a, pt_a, source=b.obj, normal=n_a,
                   ship_instances=ship_instances, weapon_type="collision",
                   hit_tangent=tan_a, decal_radius=scuff_r, decal_dent=1.0,
-                  bypass_shields=not shielded_a, shield_point=shield_pt_a,
-                  single_impact=True, shield_radius=flash_r)
+                  single_impact=True, shield_radius=flash_r, **kw)
     if b.is_movable:
         pt_b, n_b = _trace_own_hull(ship_instances, b,
                                     _shifted(boundary_b, b_offset, -1.0), n_ba, trace_reach)
-        apply_hit(b.obj, damage, pt_b, source=a.obj, normal=n_b,
+        kw = (dict(ram_kw, damage_point=_ram_damage_point(b.obj, pt_b)) if ram
+              else dict(bypass_shields=not shielded_b, shield_point=shield_pt_b))
+        apply_hit(b.obj, damage_b, pt_b, source=a.obj, normal=n_b,
                   ship_instances=ship_instances, weapon_type="collision",
                   hit_tangent=tan_b, decal_radius=scuff_r, decal_dent=1.0,
-                  bypass_shields=not shielded_b, shield_point=shield_pt_b,
-                  single_impact=True, shield_radius=flash_r)
+                  single_impact=True, shield_radius=flash_r, **kw)
 
     return (a.obj, b.obj, contact, v_rel)
+
+
+def _ram_damage_point(ship, contact):
+    """The ram's damage centre: BC_RAM_DAMAGE_DEPTH_GU from `contact` toward
+    the ship's centre, never past it (see BC_RAM_DAMAGE_DEPTH_GU)."""
+    c = ship.GetWorldLocation()
+    dx, dy, dz = c.x - contact.x, c.y - contact.y, c.z - contact.z
+    d = (dx * dx + dy * dy + dz * dz) ** 0.5
+    if d <= 1e-9:
+        return TGPoint3(contact.x, contact.y, contact.z)
+    k = min(BC_RAM_DAMAGE_DEPTH_GU, d) / d
+    return TGPoint3(contact.x + dx * k, contact.y + dy * k, contact.z + dz * k)
+
+
+def _is_ship_ram(a: "_Body", b: "_Body") -> bool:
+    """Both bodies are movable ships (not rocks, debris, planets or anchored
+    stations): BC's ship-to-ship impact rule applies."""
+    from engine.appc.ships import ShipClass
+    from engine.appc.debris_chunk import DebrisChunk
+    try:
+        from engine.rocks.rock import RockClass
+    except Exception:  # noqa: BLE001
+        RockClass = ()
+    for body in (a, b):
+        o = body.obj
+        if not body.is_movable or not isinstance(o, ShipClass):
+            return False
+        if isinstance(o, DebrisChunk) or (RockClass and isinstance(o, RockClass)):
+            return False
+    return True
 
 
 def _emit_object_collision(obj_a, obj_b, contact, force,
