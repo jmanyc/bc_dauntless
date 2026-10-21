@@ -175,8 +175,12 @@ vec4 sample_hull_decal_mask(int slot, vec2 uv, vec2 gx, vec2 gy) {
 // composite and paint specular read later. Both use the associative "over"
 // operator, so N decals in order equal one decal of the combined coverage --
 // and a single decal reproduces the pre-list math exactly (cover_a == m.a,
-// cover_rgb == m.rgb). dpdx/dpdy are p_body's screen derivatives, taken by
-// the caller OUTSIDE all branches.
+// cover_rgb == m.rgb). Projectors are tested in the REST frame: the caller
+// passes p_body / n_body / derivatives already corrected by u_node_rest_fix
+// (identity unless the draw is articulated), so a decal follows its part --
+// docs/superpowers/specs/2026-10-18-articulated-hull-decals-design.md.
+// dpdx/dpdy are those positions' screen derivatives, taken by the caller
+// OUTSIDE all branches.
 void apply_hull_decal(int i, vec3 p_body, vec3 n_body,
                       vec3 dpdx, vec3 dpdy, inout vec3 base_rgb,
                       inout float cover_a, inout vec3 cover_rgb) {
@@ -1644,9 +1648,20 @@ void main() {
     float decal_a = 0.0;
     vec3 decal_premult_rgb = vec3(0.0);
     if (u_decal_enabled_mask != 0) {
+        // REST-frame inputs (spec 2026-10-18-articulated-hull-decals §2): the
+        // same u_node_rest_fix correction the glow regions use, so a decal
+        // authored on a part keeps covering it while an override moves it.
+        // No normalize(): the correction is rigid (see the glow path's note),
+        // and identity for every unarticulated draw, so those are unchanged.
+        // Computed outside the per-decal loop and its non-uniform branches; the
+        // derivatives were taken earlier, outside all branches.
+        vec3 p_dec    = (u_node_rest_fix * vec4(p_body, 1.0)).xyz;
+        vec3 n_dec    = mat3(u_node_rest_fix) * n_body;
+        vec3 dpdx_dec = mat3(u_node_rest_fix) * dpdx_d;
+        vec3 dpdy_dec = mat3(u_node_rest_fix) * dpdy_d;
         for (int i = 0; i < MAX_HULL_DECALS; ++i) {
             if (i >= u_hull_decal_count) break;
-            apply_hull_decal(i, p_body, n_body, dpdx_d, dpdy_d,
+            apply_hull_decal(i, p_dec, n_dec, dpdx_dec, dpdy_dec,
                              base.rgb, decal_a, decal_premult_rgb);
         }
     }
@@ -1870,8 +1885,10 @@ void main() {
         float x    = dot(n, La);
         float wrap = clamp((x + 0.2) / 1.2, 0.0, 1.0);
         vec3  sunc = u_dir_light_count > 0 ? u_dir_light_color[0] : vec3(1.0);
-        // Terminator: a band where the sun grazes takes the sunset tint.
-        float band = smoothstep(0.25, 0.0, x) * step(-0.1, x) * 0.6;
+        // Terminator: a band where the sun grazes takes the sunset tint,
+        // fading out on BOTH sides. A hard night-side cut (step(-0.1, x))
+        // drew a sharp "longitude line" a few degrees past the terminator.
+        float band = (1.0 - smoothstep(0.0, 0.25, x)) * smoothstep(-0.2, -0.05, x) * 0.6;
         lit *= mix(vec3(1.0), u_atmo_sunset, band);
         // Fresnel limb: the surface hazes toward the air colour at grazing view angles.
         float f = pow(1.0 - clamp(dot(n, V), 0.0, 1.0), 3.0) * u_atmo_limb;

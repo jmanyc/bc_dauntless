@@ -5,6 +5,7 @@ pick_simplest_mission.py / pick_default_skybox.py scan results.
 """
 from __future__ import annotations
 
+import contextlib
 import importlib
 import sys
 from dataclasses import dataclass, field
@@ -57,7 +58,6 @@ try:
 except (ImportError, AttributeError):
     _audio_mod = None
 
-from engine.audio.alert_audio import AlertAudioListener
 from engine.audio.engine_rumble import install_engine_rumble_listener
 # Engine-rumble names come from LoadTacticalSounds.LoadSounds(); bridge/alert
 # names from the real LoadBridge.LoadSounds() at mission load (against a live
@@ -103,6 +103,7 @@ from engine.systems import frames as _frames
 from engine.appc.math import TGPoint3, TGMatrix3
 from engine.appc.ships import ShipClass
 from engine.appc.ship_death import _out_of_action as _oa
+from engine.appc import glow_maps as _glow_maps
 from engine.appc.ship_motion import _effective_motion, _cap_keep, _asymptote_step, step_vector_velocity, law_step_vector
 from engine.appc.subsystems import (
     TorpedoTube,
@@ -113,8 +114,6 @@ from engine.appc.subsystems import (
     impulse_online_fraction,
 )
 from engine.appc.weapon_subsystems import _target_undetectable, _same_set
-
-_alert_listener: "AlertAudioListener" = AlertAudioListener()
 
 
 def _project_root_for_cef():
@@ -146,7 +145,6 @@ def init_audio() -> None:
         return
     init_audio_backend()
     install_engine_rumble_listener()
-    _alert_listener.reset()
 
 
 def shutdown_audio() -> None:
@@ -259,7 +257,6 @@ def tick_audio(*, camera_position, camera_forward, camera_up, dt, player) -> Non
     fx, fy, fz = camera_forward
     ux, uy, uz = camera_up
     _audio_mod.update(px, py, pz, fx, fy, fz, ux, uy, uz, dt)
-    _alert_listener.tick(player)
     # Music ramps on the same dt as the rest of the audio layer, so it freezes
     # under pause rather than sliding on wall-clock.
     _pump_music(dt)
@@ -728,6 +725,112 @@ def _poll_skip_dialogue(host, input_map) -> None:
     _skip_dialogue_prev = down
 
 
+def _articulated_running_lights(ship, iid, specs) -> tuple:
+    """The 9-tuples to send for `specs` (rest positions), each light carried
+    by the articulated part it sits on and dropped if that part was severed
+    (`_part_pose_at`). The part is the light's explicit physical parent when
+    set, else the geometric `part_for_mount` rule, via
+    `physical_parents.part_for_property`."""
+    from engine.appc import part_pose
+    from engine.appc.physical_parents import PropRef
+    out = []
+    for s in specs:
+        t = s.as_tuple()
+        # The live property when the spec carries one, so a Save in the SPV
+        # reaches these spawn-time specs without a respawn.
+        prop = s.prop if s.prop is not None else PropRef(s.name,
+                                                         s.physical_parent)
+        pose = _part_pose_at(ship, iid, s.pos, prop=prop)
+        if pose is _PART_SEVERED:
+            continue
+        if pose is not None:
+            t = part_pose.apply(pose, s.pos) + t[3:]
+        out.append(t)
+    return tuple(out)
+
+
+def _register_running_lights(r, session, ship, iid) -> None:
+    """Send a ship's BlinkingLightProperty running lights to native at spawn
+    (running-lights spec §4.3). Unlit ships send nothing. The rest specs and
+    the sent list are kept so `_push_running_lights` can re-send when an
+    articulated part moves."""
+    from engine.appc import running_lights
+    specs = running_lights.lights_for(ship)
+    if not specs:
+        return
+    phase = running_lights.phase_for(ship)
+    session.ship_running_lights[iid] = phase
+    sent = _articulated_running_lights(ship, iid, specs)
+    session.ship_running_light_specs[iid] = (tuple(specs), sent)
+    r.set_running_lights(iid, list(sent), phase)
+
+
+def _resend_articulated_running_lights(r, session, ship, iid, phase) -> None:
+    """Re-send `ship`'s lights when an articulated part has moved them since
+    the last send. Native caches positions at send time and places them only
+    through the hull's own matrix, so a part's pose reaches the lights ONLY
+    through here. Unrigged ships cost one rig lookup."""
+    record = session.ship_running_light_specs.get(iid)
+    if record is None:
+        return
+    from engine.appc import articulation
+    if not articulation.posed_part_names(ship):
+        return
+    specs, last = record
+    sent = _articulated_running_lights(ship, iid, specs)
+    if sent == last:
+        return
+    session.ship_running_light_specs[iid] = (specs, sent)
+    r.set_running_lights(iid, list(sent), phase)
+
+
+def _push_running_lights(r, session, hidden_iids=()) -> None:
+    """Per-frame running-light brightness + dials (spec §4.3). Level folds in
+    death, power-plant state and the live cloak fraction; a vanished ship, or
+    one whose hull the host loop hides, is sent 0. No lit ships => no calls.
+
+    The pass ignores the instance's visible flag on purpose (a cloaking hull
+    is hidden while its lights fade), so every OTHER hull hide must be
+    mirrored here or the lights float on their own: `session.scope_hidden`,
+    the warp-transit hide (`session.warp_hidden_iids`, recorded by
+    `_sync_instance_transforms` where it hides them) and `hidden_iids` — the
+    bridge-view player hide, as returned by `_apply_bridge_player_visibility`.
+    """
+    lit = getattr(session, "ship_running_lights", None)
+    if not lit:
+        return
+    import App  # deferred, as elsewhere in this module (sound-manager init order)
+    from engine.appc import running_lights, running_light_dials
+    now = App.g_kUtopiaModule.GetGameTime()
+    by_iid = {iid: ship for ship, iid in session.ship_instances.items()}
+    hidden = (set(getattr(session, "scope_hidden", ()))
+              | set(getattr(session, "warp_hidden_iids", ()))
+              | set(hidden_iids))
+    levels = []
+    for iid, phase in lit.items():
+        ship = by_iid.get(iid)
+        if ship is None or iid in hidden:
+            levels.append((iid, 0.0))
+            continue
+        try:
+            _resend_articulated_running_lights(r, session, ship, iid, phase)
+        except Exception as _e:
+            dev_mode.log_swallowed("running light articulation", _e)
+        frac = 0.0
+        get_cloak = getattr(ship, "GetCloakingSubsystem", None)
+        cloak = get_cloak() if get_cloak is not None else None
+        if cloak is not None:
+            frac = float(cloak.GetTransitionFraction())
+        try:
+            levels.append((iid, running_lights.level_for(ship, frac, now, phase)))
+        except Exception as _e:
+            dev_mode.log_swallowed("running light level", _e)
+            levels.append((iid, 0.0))
+    r.set_running_light_levels(levels)
+    d = running_light_dials.current()
+    r.set_running_light_dials(d["size_gu_per_radius"], d["min_px"], d["intensity"])
+
+
 def _push_cloak_refraction(r, session, player) -> None:
     """Per-frame cloak VFX wiring.
 
@@ -981,20 +1084,27 @@ def _advance_combat(ships, dt: float, ship_instances=None,
         shockwaves.advance(dt)
         particles.advance(dt)
     with frame_profiler.scope("cb.death"):
-        ship_death.advance(dt)
+        with frame_profiler.scope("death.ship"):
+            ship_death.advance(dt)
         # Fireball lights age on the same clock as the death sequence that
         # scheduled them.
-        _explosion_lights.advance(dt)
+        with frame_profiler.scope("death.lights"):
+            _explosion_lights.advance(dt)
         from engine.appc import object_lifetime
-        object_lifetime.advance(dt)
+        with frame_profiler.scope("death.lifetime"):
+            object_lifetime.advance(dt)
     with frame_profiler.scope("cb.damage_sys"):
         from engine.appc import subsystem_cascade, warp_core_breach
-        subsystem_cascade.advance(dt)
-        warp_core_breach.advance(dt, ship_instances=ship_instances)
+        with frame_profiler.scope("dmg.cascade"):
+            subsystem_cascade.advance(dt)
+        with frame_profiler.scope("dmg.core_breach"):
+            warp_core_breach.advance(dt, ship_instances=ship_instances)
         from engine.appc import core_breach_carve
-        core_breach_carve.advance(dt, ship_instances=ship_instances)
+        with frame_profiler.scope("dmg.core_carve"):
+            core_breach_carve.advance(dt, ship_instances=ship_instances)
         from engine.appc import visible_damage
-        visible_damage.advance(dt, ship_instances=ship_instances)
+        with frame_profiler.scope("dmg.visible"):
+            visible_damage.advance(dt, ship_instances=ship_instances)
         camera_shake.update(dt)
 
     # BC WeaponSystem tick: one update_weapons per armed system per frame.
@@ -1587,6 +1697,48 @@ def _build_explosion_light_render_data():
     return out
 
 
+_PART_SEVERED = object()
+
+
+def _part_pose_at(ship, iid, position, prop=None):
+    """The live pose of the articulated part a hull-attached point sits on.
+
+    `position` is the point's authored rest position (body frame, ship
+    units). With `prop` (a running light's property) the part is resolved by
+    `physical_parents.part_for_property` -- the explicit physical parent, else
+    `part_severance.part_for_mount`, the rule hardpoint mounts and severance
+    share. Without `prop` (the subsystem emitter lights, deliberately) it is
+    `part_for_mount` on the point's own position. Returns the part's pose
+    (R, t), None when the point does not move (unrigged ship, no part, a part
+    at its identity pose), or `_PART_SEVERED` when its part has been shot
+    off. Shared by every per-frame attached effect -- the subsystem emitter
+    lights and the running lights -- so they follow exactly the pose
+    `_sync_ship_articulation` pushes to the renderer this frame."""
+    from engine.appc import articulation
+    names = articulation.posed_part_names(ship)
+    if not names:
+        return None
+    leaf = articulation.leaf_for(ship)
+    from engine.appc.part_severance import part_for_mount, is_detached
+    if prop is None:
+        name = part_for_mount(leaf, tuple(position), iid)
+    else:
+        from engine.appc import physical_parents
+        name = physical_parents.part_for_property(
+            leaf, prop, tuple(position), iid)
+    if name is None:
+        return None
+    if is_detached(ship, name):
+        return _PART_SEVERED
+    if name not in names:
+        return None
+    from engine.appc import part_pose
+    pose = articulation.pose_for_part(ship, name)
+    if part_pose.is_identity(pose):
+        return None
+    return pose
+
+
 def _articulate_emitter_light(ship, iid, spec, d):
     """Carry body-frame light dict `d` with the articulated part it sits on,
     or return None when that part has been severed.
@@ -1607,23 +1759,12 @@ def _articulate_emitter_light(ship, iid, spec, d):
     Identity -- the same dict, untouched -- for an unrigged ship, a light on
     no part, or a part at its identity pose.
     """
-    from engine.appc import articulation
-    names = articulation.posed_part_names(ship)
-    if not names:
-        return d
-    leaf = articulation.leaf_for(ship)
-    from engine.appc.part_severance import part_for_point, is_detached
-    name = part_for_point(leaf, tuple(spec["position"]), iid)
-    if name is None:
-        return d
-    if is_detached(ship, name):
+    pose = _part_pose_at(ship, iid, spec["position"])
+    if pose is _PART_SEVERED:
         return None
-    if name not in names:
+    if pose is None:
         return d
     from engine.appc import part_pose
-    pose = articulation.pose_for_part(ship, name)
-    if part_pose.is_identity(pose):
-        return d
     for key in ("position", "position_b"):
         if key in d:
             d[key] = part_pose.apply(pose, d[key])
@@ -1674,6 +1815,8 @@ def _build_emitter_light_render_data(ship_instances, ship_emitters,
         entries = ship_emitters.get(iid)
         if not entries:
             continue
+        if _glow_maps.is_dark(ship):
+            continue    # DisableGlowAlphaMaps / global glow off: lights too.
         try:
             loc = ship.GetWorldLocation()
             frac = commanded_impulse_frac(ship)
@@ -2308,7 +2451,7 @@ def _ctrl_held_either(h) -> bool:
 
 
 def _apply_alert_keys(h, player) -> None:
-    """Shift+1/2/3 → SetAlertLevel(GREEN/YELLOW/RED) on the player ship.
+    """Shift+1/2/3 → GREEN/YELLOW/RED alert on the player ship.
 
     Mirrors BC's DefaultKeyboardBinding: !/@/# → ET_SET_ALERT_LEVEL with
     EST_ALERT_{GREEN,YELLOW,RED}. Called once per tick before the throttle
@@ -2317,13 +2460,51 @@ def _apply_alert_keys(h, player) -> None:
     """
     if player is None or not _shift_held(h):
         return
+    # RemoveControl (AllowKeyboardInput(0)) blocks BC's binding like every
+    # non-crew-menu key -- see engine/appc/input._OnKeyboardEvent_Dispatch.
+    from engine.appc.top_window import keyboard_input_enabled
+    if not keyboard_input_enabled():
+        return
+    import App
     keys = h.keys
     if h.key_pressed(keys.KEY_1):
-        player.SetAlertLevel(ShipClass.GREEN_ALERT)
+        _request_alert(player, App.CharacterClass.EST_ALERT_GREEN,
+                       ShipClass.GREEN_ALERT)
     elif h.key_pressed(keys.KEY_2):
-        player.SetAlertLevel(ShipClass.YELLOW_ALERT)
+        _request_alert(player, App.CharacterClass.EST_ALERT_YELLOW,
+                       ShipClass.YELLOW_ALERT)
     elif h.key_pressed(keys.KEY_3):
-        player.SetAlertLevel(ShipClass.RED_ALERT)
+        _request_alert(player, App.CharacterClass.EST_ALERT_RED,
+                       ShipClass.RED_ALERT)
+
+
+def _request_alert(player, est, level) -> None:
+    """BC's alert binding: BridgeHandlers.SetAlertLevel forwards the EST_* event
+    to the XO's menu, where XOCharacterHandlers speaks her line and
+    XOMenuHandlers plays the klaxon and posts the level to the ship
+    (ShipClass.ProcessEvent applies it). The engine plays no klaxon of its own.
+
+    No bridge XO whose menu handles the event (no bridge loaded, a bare menu):
+    set the level directly, silently — the event would otherwise be swallowed.
+    """
+    import App
+    from engine.appc.characters import CharacterClass_GetObjectStrict
+    xo = CharacterClass_GetObjectStrict(App.g_kSetManager.GetSet("bridge"), "XO")
+    menu = xo.GetMenu() if xo is not None else None
+    if menu is None or not menu._handlers.get(App.ET_SET_ALERT_LEVEL):
+        player.SetAlertLevel(level)
+        return
+    evt = App.TGIntEvent_Create()
+    evt.SetEventType(App.ET_SET_ALERT_LEVEL)
+    evt.SetDestination(menu)
+    evt.SetInt(est)
+    # SDK handlers on the menu can raise (XOCharacterHandlers reads
+    # pShields.IsOn() unguarded -- a shieldless ship). Swallow and log like a
+    # button click (STButton.SendActivationEvent); BC printed and kept going.
+    try:
+        App.g_kEventManager.AddEvent(evt)
+    except Exception as _e:
+        dev_mode.log_swallowed("alert key ET_SET_ALERT_LEVEL", _e)
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -3531,6 +3712,10 @@ def _developer_family_entry():
                 module_name="engine.dev_missions.rock_fields_inside",
                 dir_name="Rock Fields Inside",
                 display_name="Rock Fields: inside Beol 4",
+            ), MissionEntry(
+                module_name="engine.dev_missions.felix_destroy",
+                dir_name="Felix Destroy",
+                display_name="Felix: Destroy (B2 baseline)",
             )],
         )],
     )
@@ -4280,6 +4465,27 @@ def _start_hull_prebake() -> None:
         dev_mode.log_swallowed("start hull volume prebake", _e)
 
 
+# SDK modules the engine itself imports lazily in combat. The SDK loader
+# parses, transforms and compiles a script on its first import in a process
+# (engine/sdk_code_cache.py is in-memory), and only five SDK missions import
+# Effects themselves, so elsewhere the first death cascade blast or hull-hit
+# smoke paid it mid-combat: 15.8 ms of a dying Sovereign's death frame in
+# Debug (perf-register P-4). Effects' module body is `import App` and three
+# constants, so importing it early has no side effects.
+_PREWARM_SDK_MODULES = ("Effects",)
+
+
+def _prewarm_sdk_modules() -> None:
+    """Import _PREWARM_SDK_MODULES at boot, after _setup_sdk. Best effort:
+    a module that fails here still imports on first use, as before."""
+    import importlib
+    for name in _PREWARM_SDK_MODULES:
+        try:
+            importlib.import_module(name)
+        except Exception as _e:  # noqa: BLE001 - never block boot
+            dev_mode.log_swallowed("prewarm SDK module %s" % name, _e)
+
+
 def _setup_sdk() -> None:
     """Install SDK finder + AST transforms so SDK script imports work."""
     if str(PROJECT_ROOT) not in sys.path:
@@ -4308,6 +4514,13 @@ def reset_sdk_globals() -> None:
     App.g_kTimerManager._time = 0.0
     App.g_kRealtimeTimerManager._time = 0.0
     _reset_timers()
+    # The timers just dropped include any mid-tunnel warp's, so its
+    # WarpSequence never reaches Completed/Abort: end its preload here, or
+    # the old mission's loads keep stepping into the new one.
+    from engine import warp_preload as _warp_preload
+    from engine.appc import warp as _warp
+    _warp_preload.end()
+    _warp.reset_preload_state()
     # Drop the object→render-instance mirror; the instances themselves are
     # torn down with the set, and the next mission's realize loops repopulate.
     render_instances.reset()
@@ -4318,6 +4531,9 @@ def reset_sdk_globals() -> None:
     if hasattr(App.g_kEventManager, "_method_handlers"):
         App.g_kEventManager._method_handlers.clear()
     register_input_handlers(App.g_kEventManager)
+    # Queued ET_SET_ALERT_LEVEL levels belong to the outgoing mission's ships.
+    from engine.appc import ships as _ships
+    del _ships._pending_alert_levels[:]
     # Reset the TopWindow shim so cutscene/fade/view/input flags don't
     # bleed across missions or in-process swaps. See
     # docs/superpowers/specs/2026-06-03-top-window-shim-design.md.
@@ -4599,8 +4815,11 @@ def _reset_sensor_state() -> None:
     # The native pass keeps its old far-field table across a mission swap --
     # mark our latch UNKNOWN (not None) so the next _push_system_nebula call
     # is forced to either clear it (unmapped/gate-closed) or rebuild it fresh
-    # (mapped, even into the same system name as before the swap).
-    _system_nebula_pushed_for = _SYSTEM_NEBULA_UNKNOWN
+    # (mapped, even into the same system name as before the swap). A latch
+    # already None means the pass holds nothing (never fed, or cleared), and
+    # a swap does not change that: leave it, so a closed setting pushes nothing.
+    if _system_nebula_pushed_for is not None:
+        _system_nebula_pushed_for = _SYSTEM_NEBULA_UNKNOWN
     # Clear concealment lock-break latches so a new mission's ships don't
     # inherit stale id()-keyed latches from the prior mission.
     from engine.appc.sensor_detection import reset_concealment_state
@@ -4924,8 +5143,8 @@ _SYSTEM_NEBULA_UNKNOWN = object()
 
 # System name whose radial-profile table the SystemNebulaPass currently holds,
 # or None once we know it holds nothing, or _SYSTEM_NEBULA_UNKNOWN right after
-# a mission swap (_reset_sensor_state) until the next _push_system_nebula call
-# resolves it one way or the other. Also reset to None whenever the
+# a mission swap (_reset_sensor_state) that found a table held, until the next
+# _push_system_nebula call resolves it one way or the other. Also reset to None whenever the
 # developer/volumetric gate closes, so re-opening it re-pushes.
 _system_nebula_pushed_for = None  # str | None | _SYSTEM_NEBULA_UNKNOWN
 # The veil (engine.dev_nebula_dials) the held profile's k_sys was solved
@@ -5140,38 +5359,39 @@ def _push_dust_profile(r, player, warp_streaking) -> None:
 
 
 def _system_nebula_gate(r) -> bool:
-    """The one gate for everything that feeds or follows the developer-only
-    SystemNebulaPass (the profile/star push AND the flare veil): developer
-    mode AND the Volumetric Nebulae setting, matching the native pass's own
-    gate. Developer mode is tested FIRST so production short-circuits
-    without a single renderer call."""
-    return dev_mode.is_enabled() and r.volumetric_nebulae_enabled()
+    """The one gate for everything that feeds or follows the SystemNebulaPass
+    (the profile/star push AND the flare veil): the Volumetric Nebulae
+    setting (part of Improved Space), matching the native pass's own gate.
+    On in production since 2026-10-16; --developer no longer matters."""
+    return bool(r.volumetric_nebulae_enabled())
 
 
 def _push_system_nebula(r, player, suns, warp_streaking) -> None:
-    """Feed the developer-only SystemNebulaPass: the mapped system's radial
+    """Feed the SystemNebulaPass: the mapped system's radial
     profile once per system (or veil-dial) change -- the pass builds its
-    far-field table from it, ~1.6s -- and, every frame the gate is open, the
+    far-field table from it (measured ~7 s for Vesuvi (15 rows) on the Debug
+    build, ~0.2 s for 3-row systems; cached per session and prebuilt during
+    the warp tunnel, so a warp arrival is only the upload) -- and, every
+    frame the gate is open, the
     star's render position, or None when the viewed set has no sun (the pass
     then lights clumps by the emissive floor only and draws no star-centred
     haze). The pushed profile carries the live dev dials' g/floor (the pass
     syncs its dials from it, so omitting them would revert tuned values) and
     a k_sys solved for the live veil dial.
 
-    Production (no --developer) returns before any renderer call: the pass
-    never runs there and was never fed, so there is nothing to clear -- even
-    after a mission swap leaves the latch UNKNOWN. With --developer, closing
-    the setting drops any held profile with a single None push."""
+    Follows the Volumetric Nebulae setting only (no --developer needed);
+    closing the setting drops any held profile with a single None push.
+    After a mission swap that found a table held, the latch is UNKNOWN, so
+    the first frame either clears it (unmapped or setting off) or re-pushes
+    it (mapped, even the same system); a swap with nothing held pushes
+    nothing."""
     global _system_nebula_pushed_for, _system_nebula_pushed_veil
-    if not dev_mode.is_enabled():
-        return
     if not _system_nebula_gate(r):
         if _system_nebula_pushed_for is not None:
             r.set_system_nebula_profile(None)
             _system_nebula_pushed_for = None
         return
     from engine.systems import frames, resolve
-    from engine.systems import profile as _profile
     m = None
     if player is not None and not warp_streaking:
         pos = frames.system_position(player)
@@ -5186,21 +5406,10 @@ def _push_system_nebula(r, player, suns, warp_streaking) -> None:
             _system_nebula_pushed_for = None
     elif (_system_nebula_pushed_for != m.system
             or _system_nebula_pushed_veil != veil):
-        colour = m.profile.color or (0.0, 0.0, 0.0)
-        star_rgb = (tuple(star.appearance.color) if star.appearance.color
-                    else (1.0, 1.0, 1.0))
-        dials = dev_nebula_dials.current()
-        r.set_system_nebula_profile({
-            "r": [row.distance_gu for row in m.profile.rows],
-            "nebula": [row.nebula for row in m.profile.rows],
-            "k_sys": _profile.k_sys(m, veil),
-            "star_radius": star.radius_gu,
-            "cloud_rgb": tuple(colour),
-            "star_rgb": star_rgb,
-            "far_gu": SCENE_FAR_GU,
-            "g": dials["g"],
-            "floor": dials["floor"],
-        })
+        from engine import system_haze
+        r.set_system_nebula_profile(system_haze.profile_dict(
+            m, veil=veil, dials=dev_nebula_dials.current(),
+            far_gu=SCENE_FAR_GU))
         _system_nebula_pushed_for = m.system
         _system_nebula_pushed_veil = veil
     r.set_system_nebula_star(tuple(suns[0]["position"]) if suns else None)
@@ -5250,7 +5459,7 @@ def _veil_flares(r, flares, player):
     under the system nebula pass they take the exact eye->star transmittance
     (spec 2026-09-29, "The sun and its flares") for the same live veil dial
     the haze's k_sys was solved for. Same gate as the pass itself
-    (_system_nebula_gate), so a developer run with the setting off does not
+    (_system_nebula_gate), so a run with the setting off does not
     dim the flare while no haze is drawn."""
     if not _system_nebula_gate(r) or player is None or not flares:
         return flares
@@ -5261,34 +5470,34 @@ def _veil_flares(r, flares, player):
 
 def _push_nebula_godrays(r, player, suns, warp_streaking) -> None:
     """The lightning flashes, to the god-ray pass (as ever) and -- under the
-    system-nebula gate, developer-only -- to SystemNebulaPass, which lights
+    system-nebula gate -- to SystemNebulaPass, which lights
     the haze and clumps from them (the new pass scatters only the star, so
-    without this a flash never lit the gas). The developer gate closed or a
-    warp streak pushes [] there; production never calls it at all, and does
-    not even ask the volumetric setting."""
+    without this a flash never lit the gas). The gate closed or a
+    warp streak pushes [] there."""
     flashes = []
     if _nebula_thunder is not None and not warp_streaking and r.nebula_lightning_enabled():
         flashes = [{"dir": f.dir, "intensity": f.intensity, "color": f.color}
                    for f in _nebula_thunder.active_flashes()]
     godrays = list(flashes)
-    if dev_mode.is_enabled():
-        system_open = _system_nebula_gate(r) and not warp_streaking
-        r.set_system_nebula_flashes(flashes if system_open else [])
-        if system_open and suns and player is not None:
-            star = _star_godray(player, suns[0]["position"])
-            if star is not None:
-                godrays.append(star)
+    system_open = _system_nebula_gate(r) and not warp_streaking
+    r.set_system_nebula_flashes(flashes if system_open else [])
+    if system_open and suns and player is not None:
+        star = _star_godray(player, suns[0]["position"])
+        if star is not None:
+            godrays.append(star)
     r.set_nebula_godrays(godrays)
 
 
 def _star_godray(player, star_render_pos):
-    """The star as a steady god-ray source (developer, system-nebula gate):
+    """The star as a steady god-ray source (system-nebula gate):
     toward the star from the render origin (the camera sits at ~0), at
     profile_fx.star_godray_intensity(godray_gain dial, the profile at the
-    player, the eye->star transmittance), in the map star's colour. None
-    when there is no light to cast (clear space, a fully veiled star) or the
-    star sits on the origin. Never a cloud-lighting flash: the haze already
-    forward-scatters the star."""
+    player, the eye->star transmittance), in the map star's colour, with its
+    render-space distance (hulls nearer than the star occlude its shafts and
+    never streak their own lights along them). None when there is no light to
+    cast (clear space, a fully veiled star) or the star sits on the origin.
+    Never a cloud-lighting flash: the haze already forward-scatters the
+    star."""
     from engine.systems import profile as _profile
     from engine.systems import profile_fx as _profile_fx
     intensity = _profile_fx.star_godray_intensity(
@@ -5303,7 +5512,7 @@ def _star_godray(player, star_render_pos):
     colour = (tuple(star.appearance.color)
               if star is not None and star.appearance.color else (1.0, 1.0, 1.0))
     return {"dir": (x / length, y / length, z / length),
-            "intensity": intensity, "color": colour}
+            "intensity": intensity, "color": colour, "distance": length}
 
 
 def _map_star(player):
@@ -5337,7 +5546,8 @@ def _push_environment_feeds(r, active_set, warp_streaking, player=None):
     suns = [] if warp_streaking else _aggregate_suns()
     suns = _with_render_positions(suns, "position", to_view_render)
     r.set_suns(suns)
-    _push_system_nebula(r, player, suns, warp_streaking)
+    with frame_profiler.scope("env.system_nebula"):
+        _push_system_nebula(r, player, suns, warp_streaking)
 
     planets = _with_render_positions(_aggregate_dust_planets(view),
                                      "position", to_view_render)
@@ -5421,7 +5631,8 @@ def _load_planet_model(r_, nif_path: str, *, cache=None,
     planet_tex_search = [str(p) for p in
                          _paths.game_asset_dirs(DEFAULT_PLANET_TEXTURE_SEARCH)]
     try:
-        handle = r_.load_model(nif_path, planet_tex_search, geosphere=geo)
+        with frame_profiler.scope("load.planet_model"):
+            handle = r_.load_model(nif_path, planet_tex_search, geosphere=geo)
     except Exception as e:
         if verbose:
             print(f"[host_loop]   skip planet: load_model({nif_path}) raised: "
@@ -6268,6 +6479,12 @@ class MissionSession:
     # `_build_ship_emitter_cache(ship)` list consumed each frame by
     # `_build_emitter_light_render_data`. Best-effort VFX; ships with no
     # baked LightEmitter* fields simply get an empty/absent entry.
+    # Running lights registered at spawn: render InstanceId -> blink phase (s).
+    # Fed per frame by _push_running_lights (running-lights spec §4.3).
+    ship_running_lights: dict[object, float] = field(default_factory=dict)
+    # Running lights' rest specs + the list last sent, per render InstanceId,
+    # so a moving articulated part re-sends them (_resend_articulated_running_lights).
+    ship_running_light_specs: dict[object, tuple] = field(default_factory=dict)
     ship_emitters: dict[object, list] = field(default_factory=dict)  # keyed by the renderer InstanceId (not int): the value is passed straight through as each light's instance_id
     planet_instances: dict[Any, int] = field(default_factory=dict)
     # Per-planet natural_scale = GetRadius() / NIF_extent, cached at load.
@@ -6290,6 +6507,10 @@ class MissionSession:
     # or past the draw distance; _reconcile_runtime_instances). Consulted by
     # every other per-frame visibility writer so none re-shows them.
     scope_hidden: set = field(default_factory=set)
+    # Ship instance ids the warp-transit hide hid on the last
+    # _sync_instance_transforms run (empty when not warping). Read by
+    # _push_running_lights, whose pass ignores the visible flag.
+    warp_hidden_iids: set = field(default_factory=set)
     # The system map's planets and moons (system-frames Plan 3 Task 4),
     # diffed each tick against celestial.draw_list(viewing_set()) by
     # _reconcile_celestial_instances. celestial_instances: body key -> iid;
@@ -6313,6 +6534,7 @@ class MissionSession:
         for iid in list(self.celestial_instances.values()):
             renderer.destroy_instance(iid)
         _atmosphere.clear_live()
+        _atmosphere.clear_requested()
         _surface.clear_live()
         self.celestial_instances.clear()
         self.celestial_placed.clear()
@@ -6320,8 +6542,11 @@ class MissionSession:
         self.ship_instances.clear()
         self.ship_glow_controllers.clear()
         self.ship_emitters.clear()
+        self.ship_running_lights.clear()
+        self.ship_running_light_specs.clear()
         self.ship_articulation.clear()
         self.scope_hidden.clear()
+        self.warp_hidden_iids.clear()
         self.planet_instances.clear()
         self.planet_natural_scale.clear()
         # The bindings themselves died with the instances above; drop the
@@ -6443,6 +6668,90 @@ def _extent_key(model_path: str, nif_path: str, model_scale: float) -> str:
     return nif_path if model_scale == 1.0 else f"{model_path}#s={model_scale:.6g}"
 
 
+def _warp_preload_deps(controller, r_) -> dict:
+    """The `engine.warp_preload.Preload` deps, built when a warp begins its
+    preload. Each loader is the SAME call realization makes on arrival, with
+    the same arguments, so the arrival hits what the tunnel loaded: the
+    native load_model dedupe for ships, controller's nif_to_handle for map
+    bodies (`_reconcile_celestial_instances`' key)."""
+    import App
+
+    def ships(name):
+        # Exactly the ships realize_set_objects would load: in the set, not
+        # yet realized. The destination set may not exist until the swap.
+        pSet = App.g_kSetManager.GetSet(name)
+        if pSet is None:
+            return []
+        session = controller.session
+        realized = session.ship_instances if session is not None else {}
+        return [s for s in _iter_ships_in_set(pSet) if s not in realized]
+
+    def load_ship(ship):
+        loaded = _load_runtime_ship_model(ship, r_)
+        if loaded is not None:
+            from engine.appc import hull_volume as _hull_volume
+            _hull_volume.prewarm_for_model(ship, loaded[0])
+
+    def planet_models(name):
+        from engine.systems import resolve
+        found = resolve.for_set(name)
+        if found is None:
+            return []
+        return [b.appearance.model for b in found[0].bodies
+                if b.orbits is not None]
+
+    def load_planet(model):
+        nif_path = _planet_model_path(model)
+        if nif_path is not None:
+            _load_planet_model(r_, nif_path, cache=controller)
+
+    return dict(renderer=r_, haze_enabled=lambda: _system_nebula_gate(r_),
+                planet_models=planet_models, load_planet=load_planet,
+                ships=ships, load_ship=load_ship,
+                atlases=bool(r_.far_enabled()))
+
+
+def _warp_preload_ready() -> bool:
+    """warp.py's preload_ready hook: no preload running is ready."""
+    from engine import warp_preload
+    p = warp_preload.active()
+    return True if p is None else bool(p.ready())
+
+
+def _warp_preload_hooks(controller, r_) -> dict:
+    """The preload_* kwargs for warp.configure_warp_hooks."""
+    from engine import warp_preload
+
+    def begin(name):
+        warp_preload.begin(name, **_warp_preload_deps(controller, r_))
+
+    def replan():
+        p = warp_preload.active()
+        if p is not None:
+            p.replan()
+
+    def pending():
+        p = warp_preload.active()
+        return [] if p is None else p.pending()
+
+    return dict(preload_begin=begin, preload_ready=_warp_preload_ready,
+                preload_replan=replan, preload_end=warp_preload.end,
+                preload_pending=pending)
+
+
+def _step_warp_preload() -> None:
+    """One step of the running warp preload, once per frame. A preload
+    failure must never take the frame loop down."""
+    from engine import warp_preload
+    p = warp_preload.active()
+    if p is None:
+        return
+    try:
+        p.step()
+    except Exception as e:
+        dev_mode.log_swallowed("warp preload step", e)
+
+
 def realize_set_objects(session, pSet, renderer, *, verbose: bool = False,
                         include_planets: bool = True,
                         ships: Optional[Iterable] = None) -> None:
@@ -6483,7 +6792,8 @@ def realize_set_objects(session, pSet, renderer, *, verbose: bool = False,
     for ship in (_iter_ships_in_set(pSet) if ships is None else ships):
         if ship in session.ship_instances:
             continue
-        loaded = _load_runtime_ship_model(ship, r_, verbose=verbose)
+        with frame_profiler.scope("realize.ship_model"):
+            loaded = _load_runtime_ship_model(ship, r_, verbose=verbose)
         if loaded is None:
             continue
         handle, model_path, _nif_path, model_scale = loaded
@@ -6512,7 +6822,8 @@ def realize_set_objects(session, pSet, renderer, *, verbose: bool = False,
         # as push_resolution above.
         try:
             from engine.appc.hull_volume import prewarm_field
-            prewarm_field(iid)
+            with frame_profiler.scope("realize.hull_prewarm"):
+                prewarm_field(iid)
         except Exception as _e:
             dev_mode.log_swallowed("prewarm hull volume field", _e)
         render_instances.register(ship, iid)
@@ -6538,6 +6849,12 @@ def realize_set_objects(session, pSet, renderer, *, verbose: bool = False,
             session.ship_emitters[iid] = _build_ship_emitter_cache(ship)
         except Exception as _e:
             dev_mode.log_swallowed("realize ship_emitters cache", _e)
+
+        # Running lights (best-effort VFX); never block spawn.
+        try:
+            _register_running_lights(r_, session, ship, iid)
+        except Exception as _e:
+            dev_mode.log_swallowed("realize running lights", _e)
 
         # Shield render state. No-op for ships without a ShieldProperty.
         # The hull box is cached unconditionally (even for unshielded hulls) —
@@ -6603,6 +6920,11 @@ def teardown_set_objects(session, pSet, renderer) -> None:
             # at the static pose until its deflection next CHANGED.
             session.ship_articulation.pop(iid, None)
             session.scope_hidden.discard(iid)
+            # Per-iid light caches (emitter lights, running lights): a
+            # recycled iid must not inherit a destroyed hull's lights.
+            session.ship_emitters.pop(iid, None)
+            session.ship_running_lights.pop(iid, None)
+            session.ship_running_light_specs.pop(iid, None)
             # The transform-slot binding died with the instance; drop the
             # re-bind guard so a re-realized object binds afresh.
             session.slot_bindings.pop(ship, None)
@@ -6840,6 +7162,8 @@ def _reconcile_runtime_instances(session, renderer, *,
                 session.ship_glow_controllers.pop(iid, None)
                 session.ship_articulation.pop(iid, None)
                 session.ship_emitters.pop(iid, None)
+                session.ship_running_lights.pop(iid, None)
+                session.ship_running_light_specs.pop(iid, None)
                 session.scope_hidden.discard(iid)
                 # The transform-slot binding died with the instance.
                 session.slot_bindings.pop(ship, None)
@@ -7052,21 +7376,49 @@ def _reconcile_scene(session, renderer, *, nif_cache=None,
     the FIRST visibility writer of the frame -- warp hide, the SPV hull hide,
     bridge-player visibility and the cloak push all AND with scope_hidden,
     and the scope only writes on a change."""
-    _ensure_system_loaded(session)
+    with frame_profiler.scope("scene.system_load"):
+        _ensure_system_loaded(session)
     if session is None:
         return
-    _reconcile_runtime_instances(
-        session, renderer, on_player_change=on_player_change, verbose=verbose)
+    with frame_profiler.scope("scene.ships"):
+        _reconcile_runtime_instances(
+            session, renderer, on_player_change=on_player_change,
+            verbose=verbose)
     # Minor-rock clouds for the viewed set (minor-rocks spec §1): reads the
     # rocks the scope reconcile just realised. Never raises.
     from engine.rocks import minors as _minors
-    _minors.reconcile(session, renderer)
+    with frame_profiler.scope("scene.minors"):
+        _minors.reconcile(session, renderer)
     # Far tier (far-tier plan Task 10): frame, sources and flagged rocks for
     # the same viewed set. Never raises.
-    _far_tier.reconcile(session, renderer)
-    _reconcile_celestial_instances(
-        session, renderer, nif_cache=nif_cache, verbose=verbose)
+    with frame_profiler.scope("scene.far_tier"):
+        _far_tier.reconcile(session, renderer)
+    with frame_profiler.scope("scene.celestial"):
+        _reconcile_celestial_instances(
+            session, renderer, nif_cache=nif_cache, verbose=verbose)
     _check_mapped_bodies_untouched(_frames.viewing_set())
+
+
+def _spike_context(session, warp_streaking) -> str:
+    """One line for a spike-log record: what was being viewed, where the
+    player was, and whether the warp tunnel was up. Never raises."""
+    def _name(obj):
+        try:
+            return obj.GetName() if obj is not None else "-"
+        except Exception:
+            return "?"
+    view = player_set = "?"
+    try:
+        view = _name(_frames.viewing_set())
+    except Exception:
+        pass
+    try:
+        player = session.player if session is not None else None
+        player_set = _name(player.GetContainingSet()) if player else "-"
+    except Exception:
+        pass
+    return ("view=%s player_set=%s warp_streaking=%s"
+            % (view, player_set, bool(warp_streaking)))
 
 
 def _fire_pending_preload_done() -> None:
@@ -7130,6 +7482,16 @@ def _process_object_deletions() -> None:
             if obj is not None:
                 from engine.appc.objects import broadcast_object_deleted
                 broadcast_object_deleted(obj)
+
+
+def _prewarm_quick_battle_panel(panel) -> None:
+    """Warm the Quick Battle setup screen's caches during boot. Best effort:
+    a failure only moves the cost back to the first open, so it never stops
+    boot."""
+    try:
+        panel.prewarm()
+    except Exception as _e:  # noqa: BLE001 - never block boot
+        dev_mode.log_swallowed("quick battle panel prewarm", _e)
 
 
 def _sync_quick_battle_panel(controller) -> None:
@@ -7381,6 +7743,35 @@ def _after_mission_change(controller, snap_scene, close_star_map) -> None:
     snap_scene()
 
 
+@contextlib.contextmanager
+def _options_cfg_from_memory(cfg, active: bool):
+    """While active, LoadConfigFile("Options.cfg") on `cfg` returns 1 without
+    touching disk.
+
+    For the QuickBattle boot when Options.cfg could not be written: the
+    in-memory mapping is exactly what a successful write would have read
+    back (SaveConfigFile serialises it, LoadConfigFile merges it back), so
+    BuildDialog builds the dialog, Start button included. Scoped to the
+    cascade; a later load of the missing file returns 0 again.
+    """
+    if not active:
+        yield
+        return
+    shadowed = "LoadConfigFile" in vars(cfg)
+    real_load = cfg.LoadConfigFile
+
+    def _load(filename):
+        return 1 if filename == "Options.cfg" else real_load(filename)
+    cfg.LoadConfigFile = _load
+    try:
+        yield
+    finally:
+        if shadowed:
+            cfg.LoadConfigFile = real_load
+        else:
+            del cfg.LoadConfigFile
+
+
 class _MissionLoader:
     """Bundles _init_mission + render-instance construction so HostController
     can call a single .load(name) method.
@@ -7427,11 +7818,15 @@ class _MissionLoader:
         # writes it). QuickBattle.BuildDialog early-returns — skipping the
         # config-dialog buttons including g_pStartButton — when
         # LoadConfigFile("Options.cfg") returns 0, and StartSimulation later
-        # dereferences g_pStartButton unconditionally. Headless there is no
-        # launcher, so guarantee the file exists (matching the real launch
-        # invariant) before the cascade builds the dialog.
-        if App.g_kConfigMapping.LoadConfigFile("Options.cfg") == 0:
-            App.g_kConfigMapping.SaveConfigFile("Options.cfg")
+        # dereferences g_pStartButton unconditionally. We have no launcher,
+        # so write the file into paths.config_dir() (matching the real
+        # launch invariant) before the cascade builds the dialog. When
+        # config_dir() is unwritable the save fails (SaveConfigFile reports
+        # it once) and the cascade's load answers from memory instead — see
+        # _options_cfg_from_memory — so Quick Battle still starts.
+        _cfg = App.g_kConfigMapping
+        _options_unsaved = (_cfg.LoadConfigFile("Options.cfg") == 0
+                            and _cfg.SaveConfigFile("Options.cfg") == 0)
 
         # Ship->bridge matrix + home-ship player-type rule: wrap
         # RecreatePlayer before the cascade's Initialize runs it, so even
@@ -7452,7 +7847,8 @@ class _MissionLoader:
         _qb_spawn.set_radius_fn(self._seed_quickbattle_ship_radius)
 
         import QuickBattle.QuickBattleGame as _QBGame
-        _QBGame.Initialize(game)
+        with _options_cfg_from_memory(_cfg, _options_unsaved):
+            _QBGame.Initialize(game)
 
         # QuickBattle.Initialize (inside the cascade above) has just run
         # BuildDialog(). A Foundation ship registered into the five tables
@@ -7729,6 +8125,12 @@ class _MissionLoader:
                 sess.ship_emitters[iid] = _build_ship_emitter_cache(ship)
             except Exception as _e:
                 dev_mode.log_swallowed("ship_emitters cache", _e)
+
+            # Running lights (best-effort VFX); never block spawn.
+            try:
+                _register_running_lights(r_, sess, ship, iid)
+            except Exception as _e:
+                dev_mode.log_swallowed("realize running lights", _e)
 
             # Register shield render state. Reads ShieldProperty data-bag
             # for glow color, decay, and skin-mode flag. No-op for ships
@@ -8984,17 +9386,22 @@ def drive_viewscreen_static_and_brightness(r, controller, ramp, dt,
 
 
 def _apply_bridge_player_visibility(r, player_iid, *, is_bridge, spv_open,
-                                    scope_hidden=False) -> None:
+                                    scope_hidden=False) -> frozenset:
     """Hide the player ship while in bridge view so it doesn't appear on its
     own viewscreen feed (and the centre-mounted forward cam doesn't clip its
     hull). No-op while the Ship Property Viewer owns the frame (it manages
     visibility itself). Idempotent — safe to call every frame.
 
     `scope_hidden`: the render scope hides the player while a cutscene shows
-    another frame (_reconcile_runtime_instances); this must not re-show it."""
+    another frame (_reconcile_runtime_instances); this must not re-show it.
+
+    Returns the iids it hid FOR BRIDGE VIEW (the player, or nothing), so the
+    running lights — which ignore the visible flag — go dark with the hull
+    (`_push_running_lights(hidden_iids=...)`)."""
     if spv_open or player_iid is None:
-        return
+        return frozenset()
     r.set_visible(player_iid, not is_bridge and not scope_hidden)
+    return frozenset((player_iid,)) if is_bridge else frozenset()
 
 
 def _ensure_target_menu() -> None:
@@ -9304,6 +9711,15 @@ def _sync_spv_articulation(session, spv_panel) -> None:
         _sync_ship_articulation(session, ship, iid)
 
 
+def _emissive_scale_for(ship, is_player: bool, hd_boost: float) -> float:
+    """Per-ship self-illumination scale: 0 for a dead hulk or a ship whose
+    glow maps are disabled (spec 2026-10-16 §6.2), the HDR boost for the
+    player, else 1."""
+    if _oa(ship) or _glow_maps.is_dark(ship):
+        return 0.0
+    return hd_boost if is_player else 1.0
+
+
 def _sync_instance_transforms(r, session, player, xform_buf, interp_alpha,
                               game_time, model_scale, player_control=None,
                               player_interp_pose=None,
@@ -9383,6 +9799,9 @@ def _sync_instance_transforms(r, session, player, xform_buf, interp_alpha,
     _warp_hide = _wh.is_active() and _wh.streak_intensity() > 0.0
     _warp_apply_vis = _warp_hide or _warp_hidden
     _warp_hidden = _warp_hide
+    # The ships this frame's warp hide hides: their running lights ignore the
+    # visible flag, so _push_running_lights reads this to darken them too.
+    _warp_hid_iids = set()
     _live_ship_iids = []
     # Hull-discharge emissive boost for the player: `_hull_discharge` is a
     # module global (HullDischargeDriver | None).  Returns exactly 1.0 when
@@ -9412,12 +9831,7 @@ def _sync_instance_transforms(r, session, player, xform_buf, interp_alpha,
                        _player_warp_glow if ship is player else None)
         # Destroyed (dying/dead) ships lose self-illumination —
         # a dark hulk in space. Hull stays lit by external light.
-        if _oa(ship):
-            r.set_emissive_scale(iid, 0.0)
-        elif ship is player:
-            r.set_emissive_scale(iid, _hd_boost)
-        else:
-            r.set_emissive_scale(iid, 1.0)
+        r.set_emissive_scale(iid, _emissive_scale_for(ship, ship is player, _hd_boost))
         _off = _view_offset(ship)
         if iid == _player_iid and _off is None:
             if player_interp_pose is not None:
@@ -9462,6 +9876,8 @@ def _sync_instance_transforms(r, session, player, xform_buf, interp_alpha,
         if _warp_apply_vis:
             r.set_visible(iid, not _warp_hide
                           and iid not in session.scope_hidden)
+            if _warp_hide:
+                _warp_hid_iids.add(iid)
         # NOTE: scale is read live, not interpolated — the
         # buffer only stores loc+rot. Fine for steady scale;
         # a mid-animation GetScale() change applies the
@@ -9479,6 +9895,7 @@ def _sync_instance_transforms(r, session, player, xform_buf, interp_alpha,
         r.set_world_transform(
             iid, _world_matrix_from(_iloc, _irot, model_scale * _ps))
     xform_buf.prune(_live_ship_iids)
+    session.warp_hidden_iids = _warp_hid_iids
     # Drop controllers for instances no longer present. The
     # player iid is excluded from _live_ship_iids (handled by
     # the continue above), so key the keep-set on the full
@@ -9859,6 +10276,20 @@ def _resolve_paths_or_report(view_w=1280, view_h=720, *, cef_ready=True):
     return resolution
 
 
+def _initial_window_size(environ) -> tuple:
+    """Starting window size: DAUNTLESS_WINDOW_SIZE=WxH, else 1280x720.
+
+    A perf baseline must be taken at a known size -- GPU cost scales with the
+    pixels drawn (docs/engine/perf-register.md, M-4). A bad value falls back
+    to the default rather than stopping the game.
+    """
+    raw = str(environ.get("DAUNTLESS_WINDOW_SIZE", "")).strip().lower()
+    w, sep, h = raw.partition("x")
+    if sep and w.isdigit() and h.isdigit() and int(w) > 0 and int(h) > 0:
+        return int(w), int(h)
+    return 1280, 720
+
+
 def run(mission_name: Optional[str] = None,
         max_ticks: Optional[int] = None) -> int:
     """Boot the renderer, init the named mission, run until the window closes
@@ -9899,7 +10330,8 @@ def run(mission_name: Optional[str] = None,
 
     boot_quickbattle = mission_name is None
 
-    r.init(1280, 720, "open_stbc")
+    _init_w, _init_h = _initial_window_size(_os.environ)
+    r.init(_init_w, _init_h, "open_stbc")
     # Verify the native module exposes every binding the renderer façade calls.
     # Catches a stale/incomplete .so at boot (a recurring hazard — host_bindings
     # compiles into both this module and build/dauntless) instead of as a
@@ -9921,7 +10353,7 @@ def run(mission_name: Optional[str] = None,
     # are reused by the pause-menu mouse-forwarding path to scale
     # framebuffer-pixel cursor coords back into the OSR view's logical
     # pixel space on Retina.
-    _CEF_VIEW_W, _CEF_VIEW_H = 1280, 720
+    _CEF_VIEW_W, _CEF_VIEW_H = _init_w, _init_h
     _cef_html = _project_root_for_cef() / "native" / "assets" / "ui-cef" / "index.html"
     # Detect the framebuffer's device-pixel ratio so CEF renders at
     # high-DPI density on Retina. Without this, the composite pass
@@ -9984,6 +10416,10 @@ def run(mission_name: Optional[str] = None,
     # normal map resolves against this, not the BC install. Bare, like the
     # two pushes around it.
     r.set_project_asset_root(str(_paths.project_asset_root()))
+    # The 12.6 MB scuff normal map resolves against that root; load it now,
+    # not in the frame of the session's first collision scuff (~0.6 s in
+    # Debug, perf-register P-11).
+    r.prewarm_scuff_normal_texture()
     # Where the native HullVolumeCache bakes/reads .dhv files for per-instance
     # hull damage fields. Pushed here, right alongside set_game_root, for the
     # same reason: it must land before the first hull volume lookup, and
@@ -10043,6 +10479,7 @@ def run(mission_name: Optional[str] = None,
             return 0
 
     _start_hull_prebake()
+    _prewarm_sdk_modules()
 
     import App
     from engine.core.loop import GameLoop
@@ -10072,10 +10509,13 @@ def run(mission_name: Optional[str] = None,
         def _warp_teardown(pSet):
             if controller.session is not None:
                 teardown_set_objects(controller.session, pSet, controller.renderer)
+        # The destination preload the tunnel waits on (engine/warp_preload):
+        # begun at the player's burst, stepped once per frame below.
         _warp.configure_warp_hooks(
             realize=_warp_realize, teardown=_warp_teardown,
             current_player=lambda: (controller.session.player
-                                    if controller.session is not None else None))
+                                    if controller.session is not None else None),
+            **_warp_preload_hooks(controller, r))
 
         # Warp-VFX flythrough (Stage 2): when the "Warp Flythrough" toggle is on
         # AND the procedural sky is on, WarpSequence_Create builds a timed
@@ -10275,6 +10715,18 @@ def run(mission_name: Optional[str] = None,
         from engine import bridge_selection as _bs
         controller.bridge_pins = _bs.load_bridge_pins()
         init_audio_backend()
+        # DAUNTLESS_DEV_RENDER_OFF=a,b: perf A/B runs with features switched
+        # off (engine/dev_render_off.py). Applied here because the planet
+        # flags are read when the boot mission realises its planets, and again
+        # after the saved settings below. A bad name stops the boot: a typo
+        # must not pass for an A/B of the unchanged scene.
+        from engine import dev_render_off as _dev_render_off
+        _render_off = _dev_render_off.from_env(_os.environ,
+                                               developer=dev_mode.is_enabled())
+        if _render_off:
+            _dev_render_off.apply(_render_off, r)
+            print("[dev-render-off] off: %s" % ", ".join(_render_off),
+                  flush=True)
         if boot_quickbattle:
             # Real SDK QuickBattle entry cascade: builds the QuickBattleRegion
             # set, GalaxyBridge, and initial player, injects the player-only
@@ -10397,9 +10849,6 @@ def run(mission_name: Optional[str] = None,
 
         controller.bridge_runtime = BridgeRuntime(
             eye=lambda: _BRIDGE_CAMERA_EYE, alert=_bridge_runtime_alert_level)
-        # Green <-> yellow/red reflection-probe cross-fade (bridge_lighting.
-        # ProbeBlend); fed the paused-aware player dt each frame below.
-        _bridge_probe_blend = _bridge_lighting.ProbeBlend()
         _bridge_probe_alert_last = [None]   # mutable box: last frame's level
 
         _after_mission_loaded()
@@ -10437,6 +10886,8 @@ def run(mission_name: Optional[str] = None,
                 _far_dials.register()
                 from engine.appc import sensor_dials as _sensor_dials
                 _sensor_dials.register()
+                from engine.appc import running_light_dials as _rl_dials
+                _rl_dials.register()
                 from engine.planets import atmosphere_dials as _atmo_dials
                 _atmo_dials.set_target_fn(
                     lambda: _nearest_live_planet(controller.session)
@@ -10568,6 +11019,8 @@ def run(mission_name: Optional[str] = None,
             light_emitters=_light_emitters, camera_shake=_camera_shake, App=App,
         )
         _settings.apply_all(_store, _settings_ctx)
+        if _render_off:
+            _dev_render_off.apply(_render_off, r)
         configuration_panel = ConfigurationPanel(
             tabs=[("graphics", "Graphics"), ("gameplay", "Gameplay"),
                   ("controls", "Controls"), ("bridges", "Bridges")],
@@ -10618,10 +11071,11 @@ def run(mission_name: Optional[str] = None,
         quick_battle_setup_panel = QuickBattleSetupPanel(
             on_start=lambda: controller.loader.start_quickbattle())
         controller.quick_battle_setup_panel = quick_battle_setup_panel
-        # Its first open used to stall the game for seconds (each ship's
-        # stats re-run its hardpoint script); do that work here, at boot,
-        # where it is cached to disk for the next launch.
-        quick_battle_setup_panel.prewarm()
+        if boot_quickbattle:
+            # Do the screen's first-open work (hull/shield probes, icons)
+            # now, while Quick Battle is still loading, instead of as a
+            # stall when the player first opens it from the XO menu.
+            _prewarm_quick_battle_panel(quick_battle_setup_panel)
 
         from engine.ui.pause_menu import default_pause_menu
         def _quit_and_manage_mods():
@@ -10841,9 +11295,23 @@ def run(mission_name: Optional[str] = None,
         # for the crew menu); used to swallow the matching release edge so it
         # never leaks to phaser fire. See the officer-pick block below.
         _bridge_left_pick_active = False
-        from engine.core.transform_buffer import TransformBuffer
+        from engine.core.transform_buffer import TransformBuffer, advance_ticks
         from engine.core.handover_smoother import HandoverSmoother
         _xform_buf = TransformBuffer()
+
+        def _tick_gameloop():
+            with frame_profiler.scope("sim.gameloop"):
+                loop.tick()
+
+        def _interp_live_poses():
+            """Live poses of every realised ship the buffer may track, for
+            advance_ticks' pre-last-tick re-seat (multi-tick frames only)."""
+            _s = controller.session
+            if _s is None:
+                return ()
+            return [(iid, obj.GetWorldLocation(), obj.GetWorldRotation())
+                    for obj, iid in list(_s.ship_instances.items())
+                    if _xform_buf.has(iid)]
         # Eases the player's drawn pose across a helm handover; see
         # engine/core/handover_smoother. Inert except during a handover window.
         _handover = HandoverSmoother()
@@ -10912,6 +11380,15 @@ def run(mission_name: Optional[str] = None,
         # Vsync off is not optional for a capture: a capped frame measures
         # the monitor. A hidden window already defaults to interval 0; this
         # sets it explicitly so a visible-window capture is uncapped too.
+        # GPU timing is opt-in (DAUNTLESS_PROFILE_GPU=1). Its timer queries
+        # make the CPU wait for the GPU, adding about the GPU frame time, so
+        # by default every capture below is CPU-only and its frame time real
+        # (docs/engine/perf-register.md, M-6).
+        host_io.profiler_set_gpu_enabled(
+            frame_profiler.gpu_timing_requested_from_env())
+        # DAUNTLESS_PROFILE_GPU_FOCUS=a,b: GPU-time these nested scopes too
+        # (perf-register.md M-1). Attribution only, like any GPU-timed run.
+        host_io.profiler_set_gpu_focus(frame_profiler.gpu_focus_from_env())
         try:
             _profile_frames = int(_os.environ.get('DAUNTLESS_PROFILE_FRAMES', '0'))
         except ValueError:
@@ -10921,6 +11398,63 @@ def run(mission_name: Optional[str] = None,
             host_io.set_swap_interval(0)
             if max_ticks is None or max_ticks > _profile_frames:
                 max_ticks = _profile_frames
+        # DAUNTLESS_PROFILE_SPIKES=<path>: write every frame over the
+        # threshold (DAUNTLESS_PROFILE_SPIKE_MS, default 100) to a file, raw.
+        # Works without --developer; vsync is left as it is.
+        if frame_profiler.configure_spike_log_from_env():
+            print("[host_loop] spike capture -> %s (>= %.0f ms)"
+                  % (frame_profiler.spike_log_path(),
+                     frame_profiler.spike_threshold_ms()), flush=True)
+        # DAUNTLESS_MOTION_TRACE=<path>: one CSV row per render frame of the
+        # player's live vs drawn pose and the camera (engine/core/motion_trace).
+        from engine.core import motion_trace
+        motion_trace.configure_from_env()
+        # Record what was captured: the drawn size drives GPU cost, and two
+        # captures at different sizes are not comparable
+        # (docs/engine/perf-register.md, M-4).
+        if frame_profiler.is_enabled():
+            try:
+                _fbw0, _fbh0 = host_io.framebuffer_size()
+                _wnw0, _wnh0 = host_io.window_size()
+                _focus0 = frame_profiler.gpu_focus_from_env()
+                print("[profile] framebuffer %dx%d, window %dx%d, headless=%s, "
+                      "gpu timing=%s%s"
+                      % (_fbw0, _fbh0, _wnw0, _wnh0,
+                         bool(_os.environ.get("OPEN_STBC_HOST_HEADLESS")),
+                         "on" if host_io.profiler_gpu_enabled() else "off",
+                         (", gpu focus=%s" % ",".join(_focus0))
+                         if _focus0 else ""),
+                      flush=True)
+            except Exception as _e:  # a profiler must never stop the game
+                print("[profile] capture header failed: %s" % _e, flush=True)
+        # DAUNTLESS_DEV_DESTROY=<name>: destroy that object once cutscenes are
+        # over, optionally quit after (engine/dev_scripted_run.py). Lets a
+        # perf baseline that needs one keypress run unattended.
+        from engine import dev_scripted_run
+        _scripted_run = dev_scripted_run.ScriptedRun.from_env(
+            _os.environ, developer=dev_mode.is_enabled())
+
+        def _scripted_destroy(name):
+            # Same death path as the `]` dev key (engine/dev_keybindings.py).
+            _sess = controller.session
+            for _ship in list(getattr(_sess, "ship_instances", {}) or {}):
+                if _ship.GetName() == name and hasattr(_ship, "DestroySystem"):
+                    _hull = _ship.GetHull()
+                    if _hull is not None:
+                        _ship.DestroySystem(_hull)
+                        return True
+            return False
+
+        def _scripted_log(line):
+            import sys
+            print(line, file=sys.stderr, flush=True)
+
+        def _scripted_view(view):
+            # What the player's view toggle does; "exterior" is the only view
+            # a baseline needs today.
+            if view == "exterior":
+                from engine.appc.top_window import TopWindow_GetTopWindow
+                TopWindow_GetTopWindow().ForceTacticalVisible()
 
         while not r.should_close():
             # Frame profiler: phase timeline for the Python half of the frame.
@@ -11355,15 +11889,19 @@ def run(mission_name: Optional[str] = None,
             # stalled frame doesn't teleport the player.
             _player_dt = 0.0 if pause.sim_frozen else min(max(_frame_dt, 0.0), MAX_FRAME_DT)
             _interp_alpha = _accumulator / TICK_DT  # in [0, 1) after step_accumulator
-            if _sim_ticks_this_frame > 0:
-                _xform_buf.roll()
-            for _ in range(_sim_ticks_this_frame):
-                # GameLoop = timers, the TimeSliceProcess scheduler, the AI
-                # tree-walk, collision avoidance, motion integration and the
-                # per-ship shield/power/cloak/repair updates. Timed separately
-                # from the weapon/combat pumps below, which it does NOT drive.
-                with frame_profiler.scope("sim.gameloop"):
-                    loop.tick()
+            # GameLoop = timers, the TimeSliceProcess scheduler, the AI
+            # tree-walk, collision avoidance, motion integration and the
+            # per-ship shield/power/cloak/repair updates. Timed separately
+            # from the weapon/combat pumps below, which it does NOT drive.
+            # advance_ticks rolls the interpolation buffer and, on a frame
+            # that runs 2+ ticks, re-seats its prev just before the last one,
+            # so the drawn pose always blends across exactly one tick.
+            advance_ticks(_xform_buf, _sim_ticks_this_frame,
+                          _tick_gameloop, _interp_live_poses)
+            # The warp tunnel's destination preload: at most one model load
+            # per frame, so no tunnel frame pays for the whole destination.
+            with frame_profiler.scope("warp.preload"):
+                _step_warp_preload()
 
             # Only snap the camera when a sim tick actually fired —
             # no tick means no state change to follow.
@@ -11798,9 +12336,11 @@ def run(mission_name: Optional[str] = None,
 
                 with frame_profiler.scope("sim.debris_chunks"):
                     from engine.appc import debris_chunk as _debris_chunk
-                    _debris_chunk.tick(_player_dt, r)
+                    with frame_profiler.scope("dc.tick"):
+                        _debris_chunk.tick(_player_dt, r)
                     from engine.appc import hull_breakup as _hull_breakup
-                    _hull_breakup.drain()
+                    with frame_profiler.scope("dc.breakup_drain"):
+                        _hull_breakup.drain()
 
                 with frame_profiler.scope("sim.collisions"):
                     collisions.tick_collisions(
@@ -12456,7 +12996,8 @@ def run(mission_name: Optional[str] = None,
             # background geometry + characters render on the viewscreen instead
             # of a black void. Idempotent; before the character visibility sync
             # + RTT below.
-            _realize_comm_sets(controller, r)
+            with frame_profiler.scope("scene.comm_sets"):
+                _realize_comm_sets(controller, r)
             # Reveal/hide comm-set characters per their SDK IsHidden() flag
             # (MissionLib.ViewscreenOn un-hides the hailing one) before the RTT
             # renders the set.
@@ -12511,7 +13052,7 @@ def run(mission_name: Optional[str] = None,
             # the player is on the bridge in state. Without this the hide-on-
             # bridge (so the ship doesn't show on its own viewscreen) leaves the
             # cutscene exterior empty — the ship you're watching is invisible.
-            _apply_bridge_player_visibility(
+            _bridge_hidden_iids = _apply_bridge_player_visibility(
                 r, _player_iid_vs,
                 is_bridge=view_mode.is_bridge and _cc is None, spv_open=_spv_open,
                 scope_hidden=(session is not None
@@ -12564,12 +13105,11 @@ def run(mission_name: Optional[str] = None,
                 player, _bridge_preview,
                 _bridge_rt.ambient_scale if _bridge_rt is not None else None))
             r.set_bridge_lighting(bridge_ambient, bridge_directionals)
-            # Bridge PBR reflection-probe cross-fade (spec
-            # 2026-10-09-bridge-pbr §6.3, §9.4): green <-> yellow/red over
-            # ProbeBlend's fade_s, frozen under pause (_player_dt is the
-            # paused-aware dt). The probes themselves are only ever
-            # recaptured on load/edit/alert change (BridgeRuntime), never
-            # per frame — this just blends between the two existing captures.
+            # Bridge reflection-probe cross-fade (spec 2026-10-17 §4.2): the
+            # renderer fades the base weights over 0.5 s, frozen under pause
+            # (_bridge_dt derives from the paused-aware _player_dt). The probes
+            # are only recaptured on load/edit (BridgeRuntime), never per
+            # frame — this just blends between the existing captures.
             _bridge_alert_level = _bridge_effective_alert(
                 _bridge_alert_level_of(player), bridge_emitters)
             _bridge_dt = _bridge_clock_dt(
@@ -12577,8 +13117,7 @@ def run(mission_name: Optional[str] = None,
             # Emissive sibling maps: the alert-level variant (task 17), every
             # frame, beside the ambient scale (a hard switch, no fade).
             host_io.set_bridge_alert_level(_bridge_alert_level)
-            host_io.set_bridge_probe_mix(
-                _bridge_probe_blend.update(_bridge_alert_level, _bridge_dt))
+            host_io.set_bridge_probe_state(_bridge_alert_level, _bridge_dt)
             if _bridge_alert_level != _bridge_probe_alert_last[0]:
                 _bridge_probe_alert_last[0] = _bridge_alert_level
                 controller.bridge_runtime.on_alert(_bridge_alert_level)
@@ -12679,6 +13218,7 @@ def run(mission_name: Optional[str] = None,
                 r, active_set, _warp_streaking, player=player)
 
             _push_cloak_refraction(r, session, player)
+            _push_running_lights(r, session, hidden_iids=_bridge_hidden_iids)
 
             _pump_letterbox(r, _letterbox_anim, _player_dt)
 
@@ -12696,15 +13236,45 @@ def run(mission_name: Optional[str] = None,
 
             frame_profiler.mark("r.frame")
             r.frame()
+            if motion_trace.enabled():
+                _mt_interp = locals().get("_interp_player")
+                motion_trace.record(
+                    t_start=_now, frame_dt=_frame_dt,
+                    ticks=_sim_ticks_this_frame, alpha=_interp_alpha,
+                    interp=_mt_interp,
+                    ai=(player is not None and player.GetAI() is not None),
+                    cutscene=_cc is not None, handover=_handover.active,
+                    live=(player.GetWorldLocation()
+                          if player is not None else None),
+                    drawn=(_player_interp_pose[0]
+                           if _player_interp_pose is not None else None),
+                    eye=locals().get("eye"), target=locals().get("target"))
             # Close the frame timeline. Deliberately AFTER r.frame(), so the
             # "r.frame" phase carries the whole render call and the loop total
             # is the real wall-clock cost of one iteration.
             frame_profiler.end_frame()
+            frame_profiler.maybe_log_spike(
+                context=lambda: _spike_context(session, _warp_streaking))
             if frame_profiler.should_report():
                 frame_profiler.print_report()
             ticks += 1
             if max_ticks is not None and ticks >= max_ticks:
                 break
+            # A dev mission may ask to end the run (felix_destroy, after the
+            # first ship death); see engine/dev_scripted_run.py.
+            if dev_mode.is_enabled() and dev_scripted_run.tick_quit_request(
+                    _player_dt, log=_scripted_log):
+                break
+            if _scripted_run is not None:
+                from engine.appc.top_window import TopWindow_GetTopWindow
+                if _scripted_run.tick(
+                        _player_dt,
+                        TopWindow_GetTopWindow().IsCutsceneMode(),
+                        _scripted_destroy,
+                        log=_scripted_log,
+                        force_view=_scripted_view,
+                        screenshot=r.request_frame_png):
+                    break
 
         # Final report while the window (and therefore the GL context and the
         # swap-interval reading) still exists -- the teardown below destroys
@@ -12720,9 +13290,12 @@ def run(mission_name: Optional[str] = None,
         _mission_change.configure(on_changed=None)
         # The warp hooks close over this controller too; left installed they
         # outlive it (a stale starbase line-of-sight hook refused every later
-        # warp near Starbase 12).
+        # warp near Starbase 12). The preload_* hooks default to None, and a
+        # preload still running holds this controller and renderer too.
         from engine.appc import warp as _warp_hooks, warp_gates as _gate_hooks
         _warp_hooks.configure_warp_hooks(realize=None, teardown=None)
+        from engine import warp_preload as _warp_preload
+        _warp_preload.end()
         _warp_hooks.configure_warp_vfx(start=None, stop=None, enabled=None,
                                        vantage_of=None)
         _gate_hooks.configure_gate_hooks(ray_collide=None)

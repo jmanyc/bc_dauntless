@@ -28,6 +28,7 @@ function _doFocusableList(state) {
     if (state.selected_tab === 'lighting') {
         out.push({kind: 'ctrl', target: 'systems_damaged'});
         out.push({kind: 'ctrl', target: 'systems_disabled'});
+        out.push({kind: 'ctrl', target: 'running_lights'});
         out.push({kind: 'ctrl', target: 'normal_maps'});
         out.push({kind: 'ctrl', target: 'normal_flip_g'});
         out.push({kind: 'ctrl', target: 'normal_strength'});
@@ -158,6 +159,8 @@ function _doRenderLightingBody(state, focusables) {
                          s.systems_damaged, isFoc('systems_damaged'));
     html += _doToggleRow('Set Systems Disabled', 'systems_disabled',
                          s.systems_disabled, isFoc('systems_disabled'));
+    html += _doToggleRow('Running Lights', 'running_lights',
+                         s.running_lights, isFoc('running_lights'));
     html += _doToggleRow('Normal Maps', 'normal_maps',
                          s.normal_maps, isFoc('normal_maps'));
     html += _doToggleRow('Normal Map Green Flip', 'normal_flip_g',
@@ -197,6 +200,23 @@ function _doRenderEnvironmentsBody(state, focusables) {
     return html;
 }
 
+// Characters tab: one Show row per SDK character, mouse only (none of these
+// rows are in the keyboard focus list, here or in the Python panel).
+// Each row stages the character on its comm set and turns the viewscreen to it.
+function _doRenderCharactersBody(state) {
+    const current = state.viewscreen_character;
+    let html = '';
+    html += '<div class="cp-row cp-capture-hint">Puts the character on the bridge '
+          + 'viewscreen the way a mission does, on the set the SDK stages them '
+          + 'on. Close this menu to look.</div>';
+    html += _doActionRow('Viewscreen Off', 'viewscreen_off', 'Off', false);
+    for (const name of (state.characters || [])) {
+        html += _doActionRow(name, 'show_character:' + name,
+                             name === current ? 'Showing' : 'Show', false);
+    }
+    return html;
+}
+
 function setDeveloperOptions(state) {
     const root = document.getElementById('developer-options-panel');
     if (!root) return;
@@ -214,6 +234,7 @@ function setDeveloperOptions(state) {
           : (state.selected_tab === 'lighting')     ? _doRenderLightingBody(state, focusables)
           : (state.selected_tab === 'environments') ? _doRenderEnvironmentsBody(state, focusables)
           : (state.selected_tab === 'diagnostics')  ? _doRenderDiagnosticsBody(state, focusables)
+          : (state.selected_tab === 'characters')   ? _doRenderCharactersBody(state)
           : '';
     }
     root.style.display = 'flex';

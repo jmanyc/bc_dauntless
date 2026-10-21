@@ -9,6 +9,8 @@
 #include <renderer/nebula_volumetric_pass.h>
 #include <renderer/nebula_godray_pass.h>
 #include <renderer/hull_discharge_pass.h>
+#include <renderer/running_light_pass.h>
+#include <renderer/running_light_math.h>
 #include <renderer/nebula_wake_pass.h>
 #include <renderer/hdr_target.h>
 #include <renderer/pipeline.h>
@@ -3158,7 +3160,8 @@ TEST_F(FrameTest, NebulaGodrayStreaksFromAnchor) {
         // Write a small bright block into the HDR colour around the anchor.
         hdr.bind();
         glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
-        glClear(GL_COLOR_BUFFER_BIT);
+        glClearDepth(1.0);   // the spot is lit SKY (cloud), not a hull
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
         // Use a scissored clear to deposit a bright patch into the HDR colour
         // attachment (no shader/mesh needed).
         glEnable(GL_SCISSOR_TEST);
@@ -3178,7 +3181,7 @@ TEST_F(FrameTest, NebulaGodrayStreaksFromAnchor) {
     paint_bright_spot();
     float before_mid[4] = {0};
     glReadPixels(mid_px, mid_py, 1, 1, GL_RGBA, GL_FLOAT, before_mid);
-    pass.render(cam, *p, {}, hdr.color_texture());
+    pass.render(cam, *p, {}, hdr.color_texture(), hdr.depth_texture());
     ASSERT_EQ(glGetError(), GL_NO_ERROR);
     float after_empty[4] = {0};
     glReadPixels(mid_px, mid_py, 1, 1, GL_RGBA, GL_FLOAT, after_empty);
@@ -3204,7 +3207,7 @@ TEST_F(FrameTest, NebulaGodrayStreaksFromAnchor) {
     }
 
     paint_bright_spot();
-    pass.render(cam, *p, {flash}, hdr.color_texture());
+    pass.render(cam, *p, {flash}, hdr.color_texture(), hdr.depth_texture());
     ASSERT_EQ(glGetError(), GL_NO_ERROR);
     float after_flash[4] = {0};
     glReadPixels(mid_px, mid_py, 1, 1, GL_RGBA, GL_FLOAT, after_flash);
@@ -3216,6 +3219,139 @@ TEST_F(FrameTest, NebulaGodrayStreaksFromAnchor) {
               before_mid[0] + before_mid[1] + before_mid[2] + 1e-3f)
         << "god-ray streak did not brighten the centre-ward pixel: "
         << after_flash[0] << "," << after_flash[1] << "," << after_flash[2];
+
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    EXPECT_EQ(glGetError(), GL_NO_ERROR);
+}
+
+// The radial scatter's SOURCE is only what lies at or beyond the light: the sky
+// (cleared depth) and, for a star, its own disc. A hull in front of the light
+// is an occluder -- it may darken the shafts behind it, but its own pixels
+// (lit windows, nacelle glows) must never be smeared along them. Live bug
+// 2026-10-19: at the Vesuvi dust cloud a Galaxy's nacelles streaked red and
+// blue down its own shadow.
+// The pass marches at half resolution in its own framebuffers; the scene keeps
+// drawing into the caller's HDR target afterwards, so that framebuffer and its
+// viewport must be bound again on return.
+TEST_F(FrameTest, NebulaGodrayRestoresCallersFramebufferAndViewport) {
+    const int kW = 200, kH = 120;
+    renderer::HdrTarget hdr;
+    hdr.resize(kW, kH);
+    scenegraph::Camera cam;
+    cam.eye = glm::vec3(0.0f, 0.0f, -600.0f); cam.target = glm::vec3(0.0f);
+    cam.up = glm::vec3(0.0f, 1.0f, 0.0f); cam.aspect = float(kW) / kH;
+    cam.near = 1.0f; cam.far = 20000.0f;
+    hdr.bind();
+    glViewport(0, 0, kW, kH);
+    glClearDepth(1.0);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    GLint fbo_before = 0;
+    glGetIntegerv(GL_FRAMEBUFFER_BINDING, &fbo_before);
+
+    renderer::GodrayFlash star;
+    star.dir = glm::vec3(0.0f, 0.0f, 1.0f);   // dead ahead: anchor on screen
+    star.intensity = 1.0f;
+    star.distance = 10000.0f;
+    renderer::NebulaGodrayPass pass;
+    pass.render(cam, *p, {star}, hdr.color_texture(), hdr.depth_texture());
+    ASSERT_EQ(glGetError(), GL_NO_ERROR);
+
+    GLint fbo_after = 0, vp[4] = {0, 0, 0, 0};
+    glGetIntegerv(GL_FRAMEBUFFER_BINDING, &fbo_after);
+    glGetIntegerv(GL_VIEWPORT, vp);
+    EXPECT_EQ(fbo_after, fbo_before);
+    EXPECT_EQ(vp[0], 0); EXPECT_EQ(vp[1], 0);
+    EXPECT_EQ(vp[2], kW); EXPECT_EQ(vp[3], kH);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+}
+
+TEST_F(FrameTest, NebulaGodrayHullsOccludeButNeverEmit) {
+    const int kW = 256, kH = 256;
+    renderer::HdrTarget hdr;
+    hdr.resize(kW, kH);
+
+    scenegraph::Camera cam;
+    cam.eye    = glm::vec3(0.0f, 0.0f, -600.0f);
+    cam.target = glm::vec3(0.0f, 0.0f,    0.0f);
+    cam.up     = glm::vec3(0.0f, 1.0f,    0.0f);
+    cam.aspect = 1.0f;
+    cam.near   = 1.0f;
+    cam.far    = 20000.0f;
+
+    const glm::mat4 proj      = cam.proj_matrix();
+    const glm::mat4 view_proj = proj * cam.view_matrix();
+    const glm::mat4 inv_vp    = glm::inverse(view_proj);
+
+    const glm::vec2 ndc_anchor(-0.6f, 0.0f);
+    glm::vec4 world_h = inv_vp * glm::vec4(ndc_anchor, 0.9f, 1.0f);
+    const glm::vec3 light_dir =
+        glm::normalize(glm::vec3(world_h) / world_h.w - cam.eye);
+    const glm::vec2 anchor01 = ndc_anchor * 0.5f + 0.5f;
+    const int spot_px = static_cast<int>(anchor01.x * kW);
+    const int spot_py = static_cast<int>(anchor01.y * kH);
+    const int mid_px  = (spot_px + kW / 2) / 2;
+    const int mid_py  = kH / 2;
+
+    // Window depth of a point `dist` GU from the eye along the light direction.
+    const float fwd_cos = glm::dot(light_dir, glm::normalize(cam.target - cam.eye));
+    auto depth_at = [&](float dist) {
+        const glm::vec4 c = proj * glm::vec4(0.0f, 0.0f, -dist * fwd_cos, 1.0f);
+        return (c.z / c.w) * 0.5f + 0.5f;
+    };
+
+    // Black scene at sky depth, then a bright 12x12 patch at `patch_depth`
+    // around the anchor (scissored colour + depth clear, no mesh needed).
+    auto paint = [&](float patch_depth) {
+        hdr.bind();
+        glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+        glClearDepth(1.0);
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+        glEnable(GL_SCISSOR_TEST);
+        glScissor(spot_px - 6, spot_py - 6, 12, 12);
+        glClearColor(8.0f, 8.0f, 8.0f, 1.0f);
+        glClearDepth(static_cast<double>(patch_depth));
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+        glDisable(GL_SCISSOR_TEST);
+        glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+        glClearDepth(1.0);
+    };
+    renderer::NebulaGodrayPass pass;
+    auto mid_after = [&](const renderer::GodrayFlash& f) {
+        pass.render(cam, *p, {f}, hdr.color_texture(), hdr.depth_texture());
+        EXPECT_EQ(glGetError(), GL_NO_ERROR);
+        float px[4] = {0};
+        glReadPixels(mid_px, mid_py, 1, 1, GL_RGBA, GL_FLOAT, px);
+        return px[0] + px[1] + px[2];
+    };
+
+    renderer::GodrayFlash star;
+    star.dir       = light_dir;
+    star.intensity = 1.0f;
+    star.color     = glm::vec3(1.0f);
+    star.distance  = 10000.0f;   // inside the far plane: drawn where it is
+
+    // A hull 100 GU out, in front of the star: occludes, never emits.
+    paint(depth_at(100.0f));
+    EXPECT_FLOAT_EQ(mid_after(star), 0.0f)
+        << "a hull's own pixels were smeared along the star's shafts";
+
+    // The star's own disc (at its distance) is a source.
+    paint(depth_at(star.distance));
+    EXPECT_GT(mid_after(star), 1e-3f) << "the star's disc no longer casts shafts";
+
+    // The sky is a source.
+    paint(1.0f);
+    EXPECT_GT(mid_after(star), 1e-3f) << "the sky no longer casts shafts";
+
+    // A lightning flash has no body: every hull occludes, only sky emits.
+    renderer::GodrayFlash flash = star;
+    flash.distance = 0.0f;
+    paint(depth_at(100.0f));
+    EXPECT_FLOAT_EQ(mid_after(flash), 0.0f)
+        << "a hull's own pixels were smeared along a lightning flash's shafts";
+    paint(1.0f);
+    EXPECT_GT(mid_after(flash), 1e-3f) << "lit sky no longer scatters a flash";
 
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
     glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
@@ -3543,4 +3679,136 @@ TEST_F(TangentBasisTest, OpaquePassLeavesUnanimatedMaterialOnStaticBase) {
     ASSERT_EQ(glGetError(), GL_NO_ERROR);
     const auto t1 = centre_rg();
     EXPECT_GT(t1.first, t1.second + 64) << "unanimated material must stay RED";
+}
+
+TEST_F(FrameTest, RunningLightDrawsAndIsDepthOccluded) {
+    const int kW = 256, kH = 256;
+    renderer::HdrTarget hdr;
+    hdr.resize(kW, kH);
+
+    scenegraph::Camera cam;
+    cam.eye    = glm::vec3(0.0f, 0.0f, -10.0f);
+    cam.target = glm::vec3(0.0f, 0.0f, 0.0f);
+    cam.up     = glm::vec3(0.0f, 1.0f, 0.0f);
+    cam.aspect = 1.0f;
+    cam.near   = 0.1f;
+    cam.far    = 1000.0f;
+
+    renderer::RunningLightSprite sp;
+    sp.world_pos = glm::vec3(0.0f);
+    sp.half_size = 0.2f;
+    sp.color     = glm::vec3(4.0f, 0.0f, 0.0f);   // HDR red
+
+    renderer::RunningLightPass pass;
+
+    auto centre = [&]() {
+        float px[4] = {0};
+        glReadPixels(kW / 2, kH / 2, 1, 1, GL_RGBA, GL_FLOAT, px);
+        return glm::vec3(px[0], px[1], px[2]);
+    };
+    auto clear_to_depth = [&](float depth) {
+        hdr.bind();
+        glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+        glClearDepth(depth);
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+        glClearDepth(1.0);
+    };
+
+    // Empty list: zero GL work, target untouched.
+    clear_to_depth(1.0f);
+    pass.render(cam, *p, {});
+    ASSERT_EQ(glGetError(), GL_NO_ERROR);
+    EXPECT_FLOAT_EQ(centre().r, 0.0f);
+
+    // Open scene: the sprite centre is bright red, additive HDR (> 1).
+    clear_to_depth(1.0f);
+    pass.render(cam, *p, {sp});
+    ASSERT_EQ(glGetError(), GL_NO_ERROR);
+    const glm::vec3 lit = centre();
+    EXPECT_GT(lit.r, 1.0f);
+    EXPECT_FLOAT_EQ(lit.g, 0.0f);
+
+    // Depth already at the near plane (a hull in front): occluded.
+    clear_to_depth(0.0f);
+    pass.render(cam, *p, {sp});
+    ASSERT_EQ(glGetError(), GL_NO_ERROR);
+    EXPECT_FLOAT_EQ(centre().r, 0.0f);
+
+    // Window depth of a world point on the eye->light line, `ahead` GU in
+    // front of the light (final review I3).
+    const glm::mat4 vp = cam.proj_matrix() * cam.view_matrix();
+    auto depth_ahead_of_light = [&](float ahead) {
+        const glm::vec3 to_eye = glm::normalize(cam.eye - sp.world_pos);
+        const glm::vec4 c = vp * glm::vec4(sp.world_pos + to_eye * ahead, 1.0f);
+        return 0.5f * (c.z / c.w) + 0.5f;
+    };
+
+    // A light authored ON the hull skin: the surface is at the light's own
+    // depth, or curves slightly over it. The eye-ward bias (half the sprite
+    // size) keeps it a whole disc instead of half-clipped / z-fighting.
+    clear_to_depth(depth_ahead_of_light(0.0f));
+    pass.render(cam, *p, {sp});
+    EXPECT_GT(centre().r, 1.0f) << "skin light at the surface depth must draw";
+    clear_to_depth(depth_ahead_of_light(0.25f * sp.half_size));
+    pass.render(cam, *p, {sp});
+    EXPECT_GT(centre().r, 1.0f) << "skin light just under the surface must draw";
+
+    // ...but the bias is only the sprite's half size: a hull a few half-sizes
+    // thick in front (a far-side light) still occludes it.
+    clear_to_depth(depth_ahead_of_light(3.0f * sp.half_size));
+    pass.render(cam, *p, {sp});
+    EXPECT_FLOAT_EQ(centre().r, 0.0f) << "far-side light must stay occluded";
+
+    // The pass must not write depth: a second sprite behind the first still draws.
+    clear_to_depth(1.0f);
+    renderer::RunningLightSprite behind = sp;
+    behind.world_pos = glm::vec3(0.0f, 0.0f, 5.0f);
+    behind.color = glm::vec3(0.0f, 4.0f, 0.0f);
+    pass.render(cam, *p, {sp, behind});
+    EXPECT_GT(centre().g, 0.0f);
+
+    // GL state restored to canonical defaults.
+    GLboolean depth_mask = GL_FALSE;
+    glGetBooleanv(GL_DEPTH_WRITEMASK, &depth_mask);
+    EXPECT_EQ(depth_mask, GL_TRUE);
+    EXPECT_FALSE(glIsEnabled(GL_BLEND));
+}
+
+TEST_F(FrameTest, RunningLightFlooredSpriteOnAPixelCornerLightsItsNeighbours) {
+    // Final review I2: when the min_px floor wins the quad is a pixel or two
+    // across. A sprite centred on a pixel CORNER puts the nearest pixel
+    // centres at 0.707 px; a falloff that is ~0 there makes a moving ship's
+    // lights flicker between blooming and invisible. Even at the old 1.5 px
+    // floor (r ~0.94 at those centres) all four neighbours must stay lit.
+    const int kW = 256, kH = 256;
+    renderer::HdrTarget hdr;
+    hdr.resize(kW, kH);
+
+    scenegraph::Camera cam;
+    cam.eye    = glm::vec3(0.0f, 0.0f, -10.0f);
+    cam.target = glm::vec3(0.0f, 0.0f, 0.0f);
+    cam.up     = glm::vec3(0.0f, 1.0f, 0.0f);
+    cam.aspect = 1.0f;
+    cam.near   = 0.1f;
+    cam.far    = 1000.0f;
+
+    // The origin projects to window (128, 128): the shared corner of pixels
+    // 127 and 128 on both axes. Size from the real floor function.
+    renderer::RunningLightSprite sp;
+    sp.world_pos = glm::vec3(0.0f);
+    sp.half_size = 0.5f * renderer::running_light_world_size(
+        1.0f, 0.0f, 1.5f, 10.0f, cam.proj_matrix()[1][1], kH);
+    sp.color     = glm::vec3(4.0f, 0.0f, 0.0f);   // intensity-4 red
+
+    hdr.bind();
+    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    renderer::RunningLightPass pass;
+    pass.render(cam, *p, {sp});
+    ASSERT_EQ(glGetError(), GL_NO_ERROR);
+
+    float px[2 * 2 * 4] = {0};
+    glReadPixels(kW / 2 - 1, kH / 2 - 1, 2, 2, GL_RGBA, GL_FLOAT, px);
+    for (int i = 0; i < 4; ++i)
+        EXPECT_GT(px[i * 4 + 0], 0.1f) << "neighbour pixel " << i << " went dark";
 }

@@ -435,33 +435,40 @@ TEST_F(SystemNebulaPassTest, ProfileWithoutAStarDrawsNoHaze) {
 // draw only inside the legacy branch, so under the system pass it vanished.
 TEST(SystemNebulaDrawPlan, WakeDrawsAfterEitherBranchUnderTheVolumetricGate) {
     using renderer::plan_nebula_draws;
-    // developer + volumetric + profile: the system pass, and the wake over it
-    auto p = plan_nebula_draws(/*volumetric=*/true, /*developer=*/true,
-                               /*has_profile=*/true, /*have_volumes=*/false,
-                               /*have_wake=*/true);
+    // volumetric + profile: the system pass, and the wake over it
+    auto p = plan_nebula_draws(/*volumetric=*/true, /*has_profile=*/true,
+                               /*have_volumes=*/false, /*have_wake=*/true);
     EXPECT_TRUE(p.system);
     EXPECT_FALSE(p.legacy);
     EXPECT_TRUE(p.wake) << "wake missing under the system nebula pass";
 
-    // production (no --developer): the legacy branch, wake exactly as before
-    p = plan_nebula_draws(true, false, true, true, true);
-    EXPECT_FALSE(p.system);
-    EXPECT_TRUE(p.legacy);
+    // local volumes alone also take the system pass (MetaNebula density bump)
+    p = plan_nebula_draws(true, false, true, true);
+    EXPECT_TRUE(p.system);
+    EXPECT_FALSE(p.legacy);
     EXPECT_TRUE(p.wake);
-    // ...and no volumes => no branch => no wake (byte-identical production)
-    p = plan_nebula_draws(true, false, true, false, true);
+    // nothing to draw => no branch => no wake
+    p = plan_nebula_draws(true, false, false, true);
     EXPECT_FALSE(p.system);
     EXPECT_FALSE(p.legacy);
     EXPECT_FALSE(p.wake);
-    // setting off: faithful pass, never the wake
-    p = plan_nebula_draws(false, true, true, true, true);
+    // setting off: faithful pass, never the wake, never the system pass
+    p = plan_nebula_draws(false, true, true, true);
     EXPECT_FALSE(p.system);
     EXPECT_TRUE(p.legacy);
     EXPECT_FALSE(p.wake);
     // nothing to wake
-    p = plan_nebula_draws(true, true, true, true, false);
+    p = plan_nebula_draws(true, true, true, false);
     EXPECT_TRUE(p.system);
     EXPECT_FALSE(p.wake);
+}
+
+// Production (no --developer) draws the system pass: the plan has no
+// developer input any more, only the Volumetric Nebulae setting.
+TEST(SystemNebulaDrawPlan, SystemDrawsWithoutDeveloper) {
+    auto p = renderer::plan_nebula_draws(true, true, true, false);
+    EXPECT_TRUE(p.system);
+    EXPECT_FALSE(p.legacy);
 }
 
 // Every MetaNebula volume is a union of up to 4 spheres (as gameplay
@@ -650,4 +657,75 @@ TEST_F(SystemNebulaPassTest, FlashesCappedAtFourAndClearedWithTheProfile) {
     pass.set_profile(band_profile(), renderer::atmosphere::LookParams{});
     pass.clear_profile();
     EXPECT_EQ(pass.flash_count(), 0);
+}
+
+// ── No temporal history (2026-10-19) ─────────────────────────────────────────
+// The pass used to blend 90% of the previous frame's cloud, reprojected from a
+// single assumed depth with no rejection. Turning the camera smeared the haze
+// across the screen and moving hulls left trails (Mark, live, Vesuvi and the
+// Belaruz dust cloud; history off showed no shimmer, so it was removed). A
+// frame must depend on its own view only.
+namespace {
+
+std::vector<float> render_haze_frame(renderer::Pipeline& pipeline,
+                                     renderer::SystemNebulaPass& pass,
+                                     const scenegraph::Camera& cam, int size = 64) {
+    renderer::HdrTarget target;
+    target.resize(size, size);
+    target.bind();
+    glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+    glClearDepth(1.0);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    const glm::mat4 inv_vp = glm::inverse(cam.proj_matrix() * cam.view_matrix());
+    renderer::Lighting lighting;
+    pass.render(cam, pipeline, {}, lighting, target.color_texture(),
+                target.depth_texture(), inv_vp, cam.eye, 0.0f);
+    EXPECT_EQ(glGetError(), GL_NO_ERROR);
+    std::vector<float> px(static_cast<std::size_t>(size) * size * 4);
+    glReadPixels(0, 0, size, size, GL_RGBA, GL_FLOAT, px.data());
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    return px;
+}
+
+scenegraph::Camera haze_camera(const glm::vec3& target) {
+    scenegraph::Camera cam;
+    cam.eye = glm::vec3(0.0f, 300000.0f, 0.0f);   // render-relative to the star
+    cam.target = target;
+    cam.up = glm::vec3(0.0f, 0.0f, 1.0f);
+    cam.aspect = 1.0f;
+    cam.near = 1.0f;
+    cam.far = 1.8e6f;
+    return cam;
+}
+
+}  // namespace
+
+TEST_F(SystemNebulaPassTest, TurningTheCameraLeavesNoTrailOfTheLastView) {
+    // Looking at the star, then turned so the star sits off-centre: a strong
+    // gradient that a carried-over history would drag along. The eye does not
+    // move, so the old per-frame reset (camera travel) never fired.
+    const auto a = haze_camera(glm::vec3(0.0f));
+    const auto b = haze_camera(glm::vec3(60000.0f, 0.0f, 20000.0f));
+
+    renderer::SystemNebulaPass turned;
+    turned.set_profile(band_profile(), renderer::atmosphere::LookParams{});
+    turned.set_star(glm::vec3(0.0f));
+    render_haze_frame(*pipeline, turned, a);
+    render_haze_frame(*pipeline, turned, a);
+    const auto after_turn = render_haze_frame(*pipeline, turned, b);
+
+    renderer::SystemNebulaPass fresh;   // never saw view a
+    fresh.set_profile(band_profile(), renderer::atmosphere::LookParams{});
+    fresh.set_star(glm::vec3(0.0f));
+    const auto only_b = render_haze_frame(*pipeline, fresh, b);
+
+    float worst = 0.0f, scale = 0.0f;
+    for (std::size_t i = 0; i < only_b.size(); ++i) {
+        worst = std::max(worst, std::fabs(after_turn[i] - only_b[i]));
+        scale = std::max(scale, std::fabs(only_b[i]));
+    }
+    ASSERT_GT(scale, 0.0f) << "precondition: the haze must show";
+    // Same view, same time, same dither: identical but for nothing.
+    EXPECT_LE(worst, 1e-6f * std::max(1.0f, scale))
+        << "the frame after the turn still carries the previous view";
 }

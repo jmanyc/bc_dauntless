@@ -6,13 +6,14 @@ sdk/Build/scripts/Icons/ShipIcons.py), decodes the TGA, encodes a PNG,
 base64-encodes the PNG into a `data:image/png;base64,...` URL, and
 caches that URL in memory keyed by species filename stem. The PNG is
 also written to disk under native/assets/ui-cef/icons/ships/ for
-inspection/debugging — that copy is gitignored.
+inspection/debugging in a developer checkout (never a packaged build) — that
+copy is gitignored.
 
-Returning a data URL (instead of a relative file path) sidesteps
-Chromium's file:// same-origin restriction: an <img src="data:..."> is
-just inline bytes, so the browser doesn't need to issue a sub-resource
-request. The index.html page can then render the silhouette without
-needing --allow-file-access-from-files or a custom CEF scheme handler.
+A data URL is just inline bytes, which suits a panel showing one icon. A
+page listing many at once (the Quick Battle screen) uses
+icon_file_url_for_species instead: a file:// PNG in the per-user cache,
+which the file:// CEF page loads (cef_app.cc enables
+allow-file-access-from-files) without inlining ~30 KB of base64 per icon.
 
 The species name passed in must match the TGA filename stem (e.g.
 "Galaxy", "Warbird", "BirdOfPrey"). The mapping from the integer
@@ -21,7 +22,9 @@ species enum to filename stem lives in engine.ui.species_icons.
 from __future__ import annotations
 
 import base64
+import hashlib
 import os
+import tempfile
 from typing import Optional
 
 from engine.ui.tga import decode_tga
@@ -50,10 +53,78 @@ _CACHE_DIR      = os.path.join(_PROJECT_ROOT, "native", "assets", "ui-cef", "ico
 
 # species stem → data URL (or None for known-missing).
 _resolved: dict[str, Optional[str]] = {}
+# species stem → file:// URL (or a data-URL fallback, or None).
+_file_urls: dict[str, Optional[str]] = {}
+# Salts the cached PNG names. The files outlive the build, so BUMP THIS when
+# decode_tga or encode_png_rgba changes what they produce.
+_PNG_CACHE_VERSION = 1
 
 
 def reset_cache() -> None:
     _resolved.clear()
+    _file_urls.clear()
+
+
+def icon_file_url_for_species(name: str) -> Optional[str]:
+    """A `file://` URL of the species' icon as a PNG in the per-user cache
+    (`paths.cache_dir()/icons/ships`), or None when there is no readable TGA.
+
+    For a page that lists many icons at once (the Quick Battle screen): a
+    data URL inlines the whole PNG, ~30 KB of base64 per icon, where this is
+    ~100 bytes. The CEF page is itself `file://` and runs with
+    allow-file-access-from-files, so it loads these like the insignias.
+
+    The file is named by a hash of the TGA's bytes, so a mod that replaces an
+    icon never gets an earlier session's PNG, and an unchanged icon is
+    reused across sessions without decoding. A cache that cannot be written
+    is reported and falls back to the data URL.
+    """
+    if not name:
+        return None
+    if name in _file_urls:
+        return _file_urls[name]
+    tga_path = str(_game_icon_file(name))
+    try:
+        with open(tga_path, "rb") as fp:
+            blob = fp.read()
+    except OSError:
+        _file_urls[name] = None
+        return None
+
+    from engine import paths
+    safe = "".join(c if c.isalnum() or c in "-_." else "_" for c in name)
+    digest = hashlib.sha1(b"v%d:" % _PNG_CACHE_VERSION + blob).hexdigest()[:16]
+    target = paths.cache_dir() / "icons" / "ships" / ("%s-%s.png" % (safe, digest))
+    if not target.is_file():
+        try:
+            width, height, rgba = decode_tga(blob)
+            png = encode_png_rgba(width, height, rgba)
+        except Exception as _e:   # mod assets are untrusted: cost only the icon
+            from engine import dev_mode
+            dev_mode.log_swallowed("ship icon %r unreadable" % tga_path, _e)
+            _file_urls[name] = None
+            return None
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            # A unique temp name: two game processes may write the same icon.
+            fd, tmp = tempfile.mkstemp(dir=target.parent, prefix=target.name,
+                                       suffix=".tmp")
+            try:
+                with os.fdopen(fd, "wb") as fp:
+                    fp.write(png)
+                os.replace(tmp, target)
+            except BaseException:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+                raise
+        except OSError as e:
+            paths.report_write_failure(target, e)
+            _file_urls[name] = icon_path_for_species(name)
+            return _file_urls[name]
+    _file_urls[name] = target.resolve().as_uri()
+    return _file_urls[name]
 
 
 def icon_path_for_species(name: str) -> Optional[str]:
@@ -93,13 +164,18 @@ def icon_path_for_species(name: str) -> Optional[str]:
         return None
 
     # Keep the disk cache for inspection / debugging.
-    try:
-        os.makedirs(_CACHE_DIR, exist_ok=True)
-        cache_path = os.path.join(_CACHE_DIR, name + ".png")
-        with open(cache_path, "wb") as fp:
-            fp.write(png)
-    except OSError:
-        pass  # disk cache is best-effort; data URL still works
+    # Developer checkouts only: the PNG lands in the repo tree, which is
+    # read-only in an installed build (even under --developer). The data URL
+    # below is what the UI actually uses.
+    from engine import dev_mode, paths
+    if dev_mode.is_enabled() and not paths.is_packaged():
+        try:
+            os.makedirs(_CACHE_DIR, exist_ok=True)
+            cache_path = os.path.join(_CACHE_DIR, name + ".png")
+            with open(cache_path, "wb") as fp:
+                fp.write(png)
+        except OSError:
+            pass  # disk cache is best-effort; data URL still works
 
     data_url = "data:image/png;base64," + base64.b64encode(png).decode("ascii")
     _resolved[name] = data_url

@@ -439,6 +439,23 @@ class _AliasLoader(importlib.abc.Loader):
         pass
 
 
+def _module_tree(path, fullname):
+    """The AST an SDK-loader file compiles from: parsed from source, or --
+    for a mod-provided Python 1.5 `.pyc` with no `.py` -- lifted from its
+    bytecode by engine.py15 into the tree that source would have parsed to.
+    Only _mod_override_spec ever hands this a `.pyc`; stock always loads
+    from SDK source. Mirrors tests/conftest._module_tree."""
+    if str(path).lower().endswith(".pyc"):
+        from engine import py15
+        return py15.load_tree(path, fullname)
+    with open(path, encoding="utf-8", errors="replace") as f:
+        source = f.read()
+    source = _fix_py2_syntax(source.expandtabs(4))
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        return ast.parse(source, filename=path)
+
+
 class _SDKLoader(importlib.abc.Loader):
     def __init__(self, path: str, also_register_as: str = None,
                  logical_rel: str = None):
@@ -453,21 +470,27 @@ class _SDKLoader(importlib.abc.Loader):
         return None
 
     def exec_module(self, module):
-        with open(self.path, encoding="utf-8", errors="replace") as f:
-            source = f.read()
-        source = source.expandtabs(4)
-        source = _fix_py2_syntax(source)
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            tree = ast.parse(source, filename=self.path)
-            tree = _MoveGlobalsToTop().visit(tree)
-            tree = _implicit_relative_fixer(self.path, self.logical_rel).visit(tree)
-            tree = _FixDottedImport().visit(tree)
-            tree = _FixPy2Sort().visit(tree)
-            tree = _FixPy2DictView().visit(tree)
-            tree = _FixPy2Compare().visit(tree)
-            ast.fix_missing_locations(tree)
-            code = compile(tree, self.path, "exec")
+        fixer = _implicit_relative_fixer(self.path, self.logical_rel)
+
+        def build():
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                tree = _module_tree(self.path, module.__name__)
+                tree = _MoveGlobalsToTop().visit(tree)
+                tree = fixer.visit(tree)
+                tree = _FixDottedImport().visit(tree)
+                tree = _FixPy2Sort().visit(tree)
+                tree = _FixPy2DictView().visit(tree)
+                tree = _FixPy2Compare().visit(tree)
+                ast.fix_missing_locations(tree)
+                return compile(tree, self.path, "exec")
+        # Parse + transform + compile once per file content (a reload() --
+        # one per ship spawn -- used to pay it every time). Keep in sync with
+        # the twin in tests/conftest.py.
+        from engine import sdk_code_cache
+        code = sdk_code_cache.compiled(
+            __name__, self.path, module.__name__, (fixer._pkg, fixer._self_name),
+            fixer._sibling_dirs, build)
         module.__dict__.setdefault('apply', lambda f, a=(), kw={}: f(*a, **kw))
         # SDK loadspacehelper.py:91 calls `reload(mod)` after ClearLocalTemplates()
         # to re-register hardpoint templates by re-running the module top-level.
@@ -531,7 +554,11 @@ def _mod_override_spec(fullname, logical, qualified=None):
     if not _mods_may_override(fullname):
         return None
     qualified = qualified or fullname
-    for suffix, is_pkg in ((".py", False), ("/__init__.py", True)):
+    # A mod's .py always beats a .pyc for the same module (Python 1.5's own
+    # rule when the two disagree), so the bytecode arms come last. Only mod
+    # files ever reach engine.py15 -- see _module_tree.
+    for suffix, is_pkg in ((".py", False), ("/__init__.py", True),
+                           (".pyc", False), ("/__init__.pyc", True)):
         hit = _mods.sdk_override(logical + suffix)
         if hit is None:
             continue
@@ -588,6 +615,16 @@ class _SDKFinder(importlib.abc.MetaPathFinder):
             return None
         if (_PROJECT_ROOT / rel).is_dir() and (_PROJECT_ROOT / rel / "__init__.py").exists():
             return None
+        # Dotted names Dauntless claims outright (spec 2026-10-16 §8.1):
+        # after the project-root shims, BEFORE the mod overlay, so a mod's
+        # own copy of a claimed package never loads.
+        from engine.compat import claimed as _claimed
+        # claimed.py's own imports re-enter this finder while it is still
+        # half-initialised; it has no claimed_spec yet, so decline.
+        _claimed_spec = getattr(_claimed, "claimed_spec", None)
+        _cspec = _claimed_spec(fullname) if _claimed_spec is not None else None
+        if _cspec is not None:
+            return _cspec
         # An installed mod's script wins over the stock SDK module. Checked
         # after the project-root shims (those are OUR replacements and must
         # not be overridable) and before the SDK itself. Never over the
@@ -689,16 +726,18 @@ class _SDKFinder(importlib.abc.MetaPathFinder):
             # No stock file of that name anywhere, but a mod may still add one
             # in a subdirectory -- this branch is the only route to it. Cannot
             # change stock behaviour: it runs only when the rglob found nothing.
-            for _key, _mf in sorted(_mods.current().files.items()):
-                if _mf.target != "sdk" or "/" not in _key:  # paths-guard: kind label
-                    continue
-                if _key.rpartition("/")[2] != fullname.lower() + ".py":
-                    continue
-                _logical = _key[:-len(".py")]
-                _spec = _mod_override_spec(
-                    fullname, _logical, _stock_dotted_name(_logical, fullname))
-                if _spec is not None:
-                    return _spec
+            # Any mod's .py beats any mod's .pyc (spec 4.3), across directories.
+            for _suffix in (".py", ".pyc"):
+                for _key, _mf in sorted(_mods.current().files.items()):
+                    if _mf.target != "sdk" or "/" not in _key:  # paths-guard: kind label
+                        continue
+                    if _key.rpartition("/")[2] != fullname.lower() + _suffix:
+                        continue
+                    _logical = _key[:-len(_suffix)]
+                    _spec = _mod_override_spec(
+                        fullname, _logical, _stock_dotted_name(_logical, fullname))
+                    if _spec is not None:
+                        return _spec
         return None
 
 

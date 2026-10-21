@@ -20,6 +20,10 @@ public:
     Shader& speck_shader() noexcept      { return *speck_; }
     Shader& rock_speck_shader() noexcept { return *rock_speck_; }
     Shader& rock_puff_shader() noexcept  { return *rock_puff_; }
+    /// Bakes rock_puff.frag's lattice hash table (FarPass, once).
+    Shader& rock_puff_hash_shader() noexcept { return *rock_puff_hash_; }
+    /// The texture unit rock_puff.frag reads the hash table from.
+    static constexpr int kRockPuffHashUnit = 13;
     Shader& backdrop_shader() noexcept   { return *backdrop_; }
     Shader& sun_shader() noexcept        { return *sun_; }
     Shader& sun_flare_shader() noexcept  { return *sun_flare_; }
@@ -31,12 +35,15 @@ public:
     Shader& nebula_upsample_shader() noexcept { return *nebula_upsample_; }
     Shader& system_nebula_shader() noexcept { return *system_nebula_; }
     Shader& nebula_godray_shader() noexcept { return *nebula_godray_; }
+    Shader& nebula_godray_mask_shader() noexcept { return *nebula_godray_mask_; }
+    Shader& nebula_godray_composite_shader() noexcept { return *nebula_godray_composite_; }
     Shader& shield_shader() noexcept     { return *shield_; }
     Shader& lens_flare_shader() noexcept { return *lens_flare_; }
     Shader& torpedo_shader() noexcept    { return *torpedo_; }
     Shader& disruptor_shader() noexcept  { return *disruptor_; }
     Shader& hit_vfx_shader() noexcept    { return *hit_vfx_; }
     Shader& hull_discharge_shader() noexcept { return *hull_discharge_; }
+    Shader& running_light_shader() noexcept { return *running_light_; }
     Shader& nebula_wake_shader() noexcept { return *nebula_wake_; }
     Shader& phaser_shader() noexcept          { return *phaser_; }
     Shader& hologram_shader() noexcept        { return *hologram_; }
@@ -61,6 +68,7 @@ private:
     std::unique_ptr<Shader> speck_;
     std::unique_ptr<Shader> rock_speck_;
     std::unique_ptr<Shader> rock_puff_;
+    std::unique_ptr<Shader> rock_puff_hash_;
     std::unique_ptr<Shader> backdrop_;
     std::unique_ptr<Shader> sun_;
     std::unique_ptr<Shader> sun_flare_;
@@ -72,12 +80,15 @@ private:
     std::unique_ptr<Shader> nebula_upsample_;
     std::unique_ptr<Shader> system_nebula_;
     std::unique_ptr<Shader> nebula_godray_;
+    std::unique_ptr<Shader> nebula_godray_mask_;
+    std::unique_ptr<Shader> nebula_godray_composite_;
     std::unique_ptr<Shader> shield_;
     std::unique_ptr<Shader> lens_flare_;
     std::unique_ptr<Shader> torpedo_;
     std::unique_ptr<Shader> disruptor_;
     std::unique_ptr<Shader> hit_vfx_;
     std::unique_ptr<Shader> hull_discharge_;
+    std::unique_ptr<Shader> running_light_;
     std::unique_ptr<Shader> nebula_wake_;
     std::unique_ptr<Shader> phaser_;
     std::unique_ptr<Shader> hologram_;

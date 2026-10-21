@@ -56,6 +56,8 @@ embed_shader(SHADER_ROCK_SPECK_VS shaders/rock_speck.vert rock_speck_vs)
 embed_shader(SHADER_ROCK_SPECK_FS shaders/rock_speck.frag rock_speck_fs)
 embed_shader(SHADER_ROCK_PUFF_VS shaders/rock_puff.vert rock_puff_vs)
 embed_shader(SHADER_ROCK_PUFF_FS shaders/rock_puff.frag rock_puff_fs)
+embed_shader(SHADER_ROCK_PUFF_HASH_VS shaders/rock_puff_hash.vert rock_puff_hash_vs)
+embed_shader(SHADER_ROCK_PUFF_HASH_FS shaders/rock_puff_hash.frag rock_puff_hash_fs)
 embed_shader(SHADER_BACKDROP_VS shaders/backdrop.vert backdrop_vs)
 embed_shader(SHADER_BACKDROP_FS shaders/backdrop.frag backdrop_fs)
 embed_shader(SHADER_SUN_VS shaders/sun.vert sun_vs)
@@ -77,6 +79,8 @@ embed_shader(SHADER_NEBULA_UPSAMPLE_FS shaders/nebula_upsample.frag nebula_upsam
 embed_shader(SHADER_SYSTEM_NEBULA_FS shaders/system_nebula.frag system_nebula_fs)
 embed_shader(SHADER_NEBULA_GODRAY_VS shaders/nebula_godray.vert nebula_godray_vs)
 embed_shader(SHADER_NEBULA_GODRAY_FS shaders/nebula_godray.frag nebula_godray_fs)
+embed_shader(SHADER_NEBULA_GODRAY_MASK_FS shaders/nebula_godray_mask.frag nebula_godray_mask_fs)
+embed_shader(SHADER_NEBULA_GODRAY_COMPOSITE_FS shaders/nebula_godray_composite.frag nebula_godray_composite_fs)
 embed_shader(SHADER_SHIELD_VS shaders/shield.vert shield_vs)
 embed_shader(SHADER_SHIELD_FS shaders/shield.frag shield_fs)
 embed_shader(SHADER_LENS_FLARE_VS shaders/lens_flare.vert lens_flare_vs)
@@ -91,6 +95,8 @@ embed_shader(SHADER_HIT_VFX_VS shaders/hit_vfx.vert hit_vfx_vs)
 embed_shader(SHADER_HIT_VFX_FS shaders/hit_vfx.frag hit_vfx_fs)
 embed_shader(SHADER_HULL_DISCHARGE_VS shaders/hull_discharge.vert hull_discharge_vs)
 embed_shader(SHADER_HULL_DISCHARGE_FS shaders/hull_discharge.frag hull_discharge_fs)
+embed_shader(SHADER_RUNNING_LIGHT_VS shaders/running_light.vert running_light_vs)
+embed_shader(SHADER_RUNNING_LIGHT_FS shaders/running_light.frag running_light_fs)
 embed_shader(SHADER_NEBULA_WAKE_VS shaders/nebula_wake.vert nebula_wake_vs)
 embed_shader(SHADER_NEBULA_WAKE_FS shaders/nebula_wake.frag nebula_wake_fs)
 embed_shader(SHADER_PHASER_VS shaders/phaser.vert phaser_vs)
@@ -191,6 +197,7 @@ add_library(renderer STATIC
     planet_detail_pass.cc
     atmosphere_pass.cc
     system_nebula_pass.cc
+    system_nebula_cache.cc
     nebula_godray_pass.cc
     shockwave_pass.cc
     aabb.cc
@@ -206,6 +213,9 @@ add_library(renderer STATIC
     torpedo_pass.cc
     hit_vfx_pass.cc
     hull_discharge_pass.cc
+    running_light_pass.cc
+    running_light_math.cc
+    running_light_store.cc
     nebula_wake_pass.cc
     particle_pass.cc
     phaser_pass.cc
@@ -227,6 +237,7 @@ add_library(renderer STATIC
     bridge_pass.cc
     bridge_ao_pass.cc
     bridge_probe.cc
+    bridge_probe_array.cc
     viewscreen_static_pass.cc
     light_matrix.cc
     shadow_map_target.cc

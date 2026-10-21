@@ -45,6 +45,7 @@ add_executable(renderer_tests
     planet_detail_pass_test.cc
     planet_detail_bench_test.cc
     system_nebula_pass_test.cc
+    system_nebula_cache_test.cc
     motion_blur_shutter_test.cc
     letterbox_pass_test.cc
     aabb_test.cc
@@ -66,12 +67,16 @@ add_executable(renderer_tests
     skin_shield_test.cc
     lens_flare_pass_test.cc
     bridge_pass_test.cc
+    bridge_probe_signature_test.cc
+    bridge_probe_schedule_test.cc
     bridge_lighting_test.cc
     bridge_pbr_test.cc
     bridge_ao_test.cc
     bridge_highlight_test.cc
     bridge_pbr_frame_test.cc
     bridge_probe_test.cc
+    bridge_probe_array_test.cc
+    bridge_probe_content_test.cc
     skinned_bridge_test.cc
     head_weld_seam_test.cc
     officer_jaw_test.cc
@@ -106,6 +111,7 @@ add_executable(renderer_tests
     torpedo_anim_test.cc
     torpedo_pass_test.cc
     dynamic_lights_test.cc
+    running_light_test.cc
     debug_volume_pass_test.cc
     starmap_pass_test.cc
     text_input_test.cc
@@ -144,6 +150,7 @@ target_include_directories(renderer_tests PRIVATE
     ${CMAKE_SOURCE_DIR}/native/tests/assets/gpu  # reuse gl_fixture for offscreen contexts
     ${CMAKE_SOURCE_DIR}/native/src/assets/src    # model_build.h (model_parts_test.cc)
     ${CMAKE_SOURCE_DIR}/native/tests             # support/content_root.h
+    ${CMAKE_BINARY_DIR}/native/src/renderer      # embedded_*_{vs,fs}.h (shader source guards)
 )
 
 gtest_discover_tests(renderer_tests

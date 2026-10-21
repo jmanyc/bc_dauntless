@@ -24,6 +24,82 @@ OPEN_STBC_HOST_HEADLESS=1 DAUNTLESS_PROFILE_FRAMES=600 ./build/dauntless --devel
 `DAUNTLESS_PROFILE_FRAMES=N` enables both halves, sets swap interval 0, runs N
 frames, prints one report and exits.
 
+### GPU timing is opt-in — `DAUNTLESS_PROFILE_GPU=1`
+
+By default the profiler is **CPU-only**: no GPU timer query is issued, the gpu
+column prints `-`, and the report says `GPU timing OFF`. That is the mode for
+frame time. `DAUNTLESS_PROFILE_GPU=1` turns on GPU timing to split GPU cost
+between the top-level passes. **Never read frame time from that run:** on this
+Mac the queries make the CPU wait for the GPU every frame, adding about the
+GPU frame time (`perf-register.md` M-6, SIG-019). The wait shows up as a large
+`cef.composite`.
+
+Measured in `rock_fields_inside` (`perf-register.md` C-008, C-009): profiler off
+21.3 ms per frame, CPU-only 22.9 ms, GPU-timed 29.7 ms.
+
+### GPU focus — nested passes on Apple's GL — `DAUNTLESS_PROFILE_GPU_FOCUS`
+
+`GL_TIME_ELAPSED` queries cannot nest, so on this Mac only the top-level
+passes get a GPU figure (see "GPU timer selection"). A focus names nested
+scopes to time anyway:
+
+```bash
+DAUNTLESS_PROFILE_GPU_FOCUS=space.opaque,rock.puffs.draw,space.system_nebula ./build/dauntless --developer
+```
+
+While a focus scope runs, its top-level pass's query is ended, a new one
+times the focus scope, and a third resumes the pass when it closes. The
+pass's row is the sum of all its segments, so it reads as it does without a
+focus (16 splits moved `space` by 0.2 ms, `perf-register.md` SIG-065). A
+focus scope inside another open focus scope stays `-`. The report names the
+focus scopes in a line above the table, and the `[profile]` header carries
+them.
+
+- **It turns GPU timing on**, with the M-6 cost: never read frame time from
+  a focused run.
+- **A span can hold other draws' work.** Apple's GPU defers drawing in
+  tiles, so work queued before a span may execute inside it. Confirm a large
+  row by switching the feature off in a CPU-only run
+  (`DAUNTLESS_DEV_RENDER_OFF`, `engine/dev_render_off.py`).
+- **Pass totals depend on the focus list; focused spans do not.** In one 4K
+  scene, 6 focus scopes reported a 70 ms GPU frame and 20 scopes 48 ms (the
+  real, GPU-bound frame was 46 ms), while every scope focused in both agreed
+  within 0.1 ms (`perf-register.md` SIG-074). Compare totals only between
+  runs with the same list; focus every sibling when the total matters.
+
+`renderer::FrameTimer::set_gpu_focus` / `host_io.profiler_set_gpu_focus`;
+tests in `tests/host/test_frame_profiler_gl.py` and `frame_timer_test.cc`.
+
+### Spike capture — one-off long frames, to a file
+
+The averaged report **cannot see a single slow frame**: a 5 s hitch is blended
+in at alpha 0.15 and has decayed before the next 120-frame report prints. For a
+load hitch (a warp arrival, a mission change) write the raw breakdown of every
+slow frame to a file instead:
+
+```bash
+DAUNTLESS_PROFILE_SPIKES=/tmp/spikes.log ./build/dauntless
+```
+
+- Every frame at or over `DAUNTLESS_PROFILE_SPIKE_MS` (default 100) is appended
+  as one record: the frame's **raw** Python phases/scopes (ms + calls), then the
+  render scopes' raw CPU ms for the same frame (`profiler_last_frame_raw` — GPU
+  resolves frames later and is left out), plus a context line (viewed set,
+  player's set, warp tunnel up or not).
+- Rows under 0.5 ms are omitted. Indented rows are included in their parent.
+- Works **without** `--developer`; vsync is left alone; the periodic stderr
+  report is suppressed while it is on. Toggling the profiler off from Developer
+  Options stops the capture.
+- Arrival-path scopes it reads: `warp.mission_change`, `warp.swap_set` ⊃
+  `warp.region_init` / `warp.realize_set` ⊃ `realize.ship_model` /
+  `realize.hull_prewarm`; `scene.system_load`, `scene.ships`, `scene.minors`,
+  `scene.far_tier`, `scene.celestial` ⊃ `load.planet_model`;
+  `scene.comm_sets`; `env.system_nebula`; native `rock.near.stream`,
+  `space.far.build`, `sky.bake`, `rock.atlas.load`; `warp.place_player` and
+  `warp.depart` (the QuickBattle arrival and the departure). During the
+  tunnel: `warp.preload` (the destination preload's one step per frame,
+  `engine/warp_preload.py`).
+
 **Run it through `dauntless.exe`, not `python -c "host_loop.run()"`.** CEF only
 initialises when the process was launched through the binary — its `main()`
 calls `dispatch_subprocess` before Python starts — so a Python-driven capture
@@ -96,8 +172,9 @@ number and reach a wrong conclusion:
   top-level passes: `space`, `bloom`, `post`, `present`, ...) carry a GPU
   figure. Every nested row (`space.opaque`, `space.shield`, ...) keeps its CPU
   time and prints `-` for GPU, and the report says so in a line above the
-  table. To get a nested pass's GPU time you must promote it to top level, or
-  run on a driver with a timestamp counter.
+  table. To get a nested pass's GPU time, name it in
+  `DAUNTLESS_PROFILE_GPU_FOCUS` (above), or run on a driver with a timestamp
+  counter.
 * **`frame`'s GPU under `GL_TIME_ELAPSED` is the SUM of the timed passes**, not
   a span — they run in sequence, so the sum is the frame. GPU work outside
   every top-level scope is not covered (there is essentially none).
@@ -129,6 +206,13 @@ number and reach a wrong conclusion:
 * **A missing render half says UNAVAILABLE.** A stale extension module yields an
   empty scope list, and a report that silently omitted the render passes would
   read as "the render costs nothing".
+* **`bridge.probe_capture` is CPU only on this Mac.** It wraps each bridge
+  reflection-probe capture step (one per frame while probes are dirty, 17 per
+  probe — spec `2026-10-17-bridge-reflection-layers-design.md` §8) and is
+  nested in the top-level `bridge` scope, so under `GL_TIME_ELAPSED` it prints
+  `-` for GPU and the step's GPU cost lands in `bridge`. To measure a step,
+  compare `bridge` during a fill with `bridge` once settled (or with no
+  reflections dirty).
 
 `calls` is the raw count from the last resolved frame, not an average, so a pass
 that ran twice (the exterior view **and** the bridge viewscreen RTT both call
@@ -156,6 +240,15 @@ The availability check must therefore be on the last query **issued**
 `samples.back()` — the last scope pushed, whose end query is issued earlier.
 
 ## Cost when ON — the profiler is not free on this Mac
+
+⚠️ **Superseded by a live measurement (2026-10-17, `perf-register.md` M-6,
+SIG-019).** In a real scene, the GPU timer makes the CPU wait for the GPU every
+frame, which adds **roughly the GPU frame time**, not the +0.6 to +2.4 ms below.
+The wait lands in the overlay's draw call inside `cef.composite`, so that row
+reads as a large cost when it is really the profiler. Measured with the
+profiler off: 29.7 → 21.3 ms per frame in a scene with 10.5 ms of GPU time.
+**Never read frame time from a GPU-timed capture.** The bench below measured a
+light headless scene and is kept for its per-pass breakdown.
 
 Measured 2026-10-08, headless Debug build, `tools/bench_idle_passes.py`
 (640x360, one shielded Galaxy; "loaded" = 40 extra hulls), profiler on vs off,
@@ -356,6 +449,22 @@ ships at lower frequency; (c) move hot paths to C++.
   (`host_bindings.cc`) add `rock.near.stream`, `rock.near.draw`,
   `rock.fade.draw` (the translucent impostor fades), `rock.puffs.draw` and
   `rock.specks.draw`, alongside the earlier far-tier `space.far.*` scopes.
+  Spike-capture attribution scopes (warp arrival): `gl.timers.game` /
+  `gl.timers.real` (timer ticks in `loop.py`), `warp.depart`,
+  `warp.place_player`, `warp.arrive_finalize`, `warp.exited_warp`,
+  `warp.clear_targets` (the arrival actions in `engine/appc/warp.py`), and
+  `rock.near.draw` split into `rock.near.build`, `rock.near.mesh_draw`,
+  `rock.impostor.draw`, with `rock.atlas.load` (first-visit impostor atlas
+  load in `FarPass::atlas_for`: about 7 ms of upload a rock when the
+  mission-load prefetch has decoded it, about 120 ms when it has not, as
+  before that prefetch existed; `perf-register.md` P-11). The prefetch's
+  one-a-frame uploads show as `scene.far_tier` time.
+  Death-path attribution scopes (`perf-register.md` P-4): under
+  `cb.damage_sys`, `dmg.cascade` / `dmg.core_breach` / `dmg.core_carve` /
+  `dmg.visible` ⊃ `vd.carve` (the native `hull_carve_add` brush) and
+  `vd.after_carve` ⊃ `hb.split_detached` (the connectivity BFS) /
+  `hb.spawn` (chunk spawns); under `sim.debris_chunks`, `dc.tick` and
+  `dc.breakup_drain` (the throttled split, ⊃ the same `hb.*`).
   `planet_detail` (clipmap bake for the planet surface detail pass) is a
   top-level, GPU-timed scope — a sibling of `space`/`bloom`/`post`, not
   nested under any of them.

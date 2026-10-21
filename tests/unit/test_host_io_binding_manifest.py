@@ -119,16 +119,21 @@ def test_optional_holds_exactly_the_soft_guarded_bindings():
         "starmap_set_enabled", "starmap_set_viewport",
         "starmap_set_camera", "starmap_set_scene",
         "profiler_set_enabled", "profiler_enabled",
-        "profiler_scopes", "profiler_frame",
+        "profiler_set_gpu_enabled", "profiler_gpu_enabled",
+        "profiler_set_gpu_focus",
+        "profiler_scopes", "profiler_frame", "profiler_last_frame_raw",
         "set_swap_interval", "swap_interval",
         "set_cursor_shape",
         "ray_trace_mesh_pick", "model_identity", "set_bridge_highlight",
         "set_bridge_material_overrides", "set_bridge_pbr_enabled",
         "set_bridge_probe_origin", "set_bridge_probe_scales",
-        "set_bridge_probe_mix", "request_bridge_probe_capture",
+        "request_bridge_probe_capture",
         "set_bridge_spots", "set_bridge_alert_level",
         "set_bridge_spot_colours", "set_bridge_glow",
         "set_bridge_area_lights", "set_bridge_area_colours", "bridge_mesh_geometry",
+        "set_bridge_glow_captures", "set_bridge_probe_layers",
+        "bridge_probe_signatures", "bridge_quality",
+        "set_bridge_probe_state", "set_bridge_layer_values",
     })
 
 

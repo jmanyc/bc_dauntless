@@ -35,9 +35,42 @@ def host():
 
 @pytest.fixture(autouse=True)
 def _clean_profiler(host):
+    # Most of this module covers the GPU query path, so it opts in to GPU
+    # timing, which is OFF by default (perf-register.md M-6). The CPU-only
+    # tests turn it back off themselves.
     host.profiler_set_enabled(False)
+    host.profiler_set_gpu_enabled(True)
     yield
     host.profiler_set_enabled(False)
+    host.profiler_set_gpu_enabled(False)
+
+
+def test_cpu_only_mode_issues_no_gpu_queries_and_still_times_the_cpu(host):
+    """GPU timing off is the default because the queries themselves make the
+    CPU wait for the GPU (perf-register.md SIG-019). Off must mean no query of
+    any kind, while the CPU column keeps measuring."""
+    host.profiler_set_gpu_enabled(False)
+    host.profiler_set_enabled(True)
+    _run_frames(20)
+    f = host.profiler_frame()
+    assert f["gpu_requested"] is False, f
+    assert f["gpu_timer"] == "none", f
+    assert f["gpu_queries"] is False, f
+    assert f["timestamp_queries"] == 0, f
+    scopes = host.profiler_scopes()
+    assert scopes, "nothing resolved"
+    assert not any(s["gpu_measured"] for s in scopes), scopes
+    frame_row = [s for s in scopes if s["name"] == "frame"][0]
+    assert frame_row["cpu_ms"] > 0.0, frame_row
+
+
+def test_requesting_gpu_timing_uses_the_drivers_timer(host):
+    host.profiler_set_enabled(True)
+    _run_frames(8)
+    f = host.profiler_frame()
+    assert f["gpu_requested"] is True, f
+    assert f["gpu_timer"] == _expected_timer(f["timestamp_bits"],
+                                             f["elapsed_bits"]), f
 
 
 def _run_frames(n):
@@ -321,3 +354,128 @@ def test_the_whole_frame_gpu_total_agrees_with_the_frame_row(host):
     # returns zeros they are both 0.
     assert abs(total - by_name["frame"]["gpu_ms"]) <= 0.5 + 0.05 * total, (
         total, by_name["frame"])
+
+
+def test_last_frame_raw_is_available_immediately_and_unsmoothed(host):
+    """The spike log reads the frame that JUST ended: no ring latency, and
+    the frame row's raw CPU time matches the whole-frame raw total."""
+    host.profiler_set_enabled(True)
+    _run_frames(1)
+    raw = host.profiler_last_frame_raw()
+    by_name = {s["name"]: s for s in raw["scopes"]}
+    assert "frame" in by_name, sorted(by_name)
+    assert by_name["frame"]["depth"] == 0
+    assert by_name["frame"]["cpu_ms"] > 0.0
+    assert by_name["frame"]["cpu_ms"] <= raw["cpu_ms"] + 1e-6
+    assert set(raw["scopes"][0]) == {"name", "cpu_ms", "calls", "depth"}
+
+
+def test_last_frame_raw_is_empty_when_disabled(host):
+    _run_frames(2)
+    assert host.profiler_last_frame_raw()["scopes"] == []
+
+
+# ── GPU focus (perf-register.md M-1) ─────────────────────────────────────────
+# GL_TIME_ELAPSED cannot nest, so on Apple's GL a nested pass has no GPU
+# figure. A focus names nested scopes to time anyway: the enclosing top-level
+# pass's query is suspended while the focus scope runs and resumed after, so
+# the top-level row still totals all of it.
+
+def _nested_rows_with_parents(scopes):
+    """(nested row, its depth-1 ancestor row) for every row deeper than 1."""
+    out, parent = [], None
+    for s in scopes:
+        if s["depth"] == 1:
+            parent = s
+        elif s["depth"] >= 2 and parent is not None:
+            out.append((s, parent))
+    return out
+
+
+@pytest.fixture
+def _no_focus(host):
+    yield
+    host.profiler_set_gpu_focus([])
+
+
+def test_no_gpu_focus_by_default(host):
+    host.profiler_set_enabled(True)
+    _run_frames(8)
+    assert host.profiler_frame()["gpu_focus"] == []
+
+
+def test_a_focus_scope_is_gpu_timed_while_nested(host, _no_focus):
+    host.profiler_set_enabled(True)
+    _run_frames(10)
+    pairs = _nested_rows_with_parents(host.profiler_scopes())
+    assert pairs, "an empty headless frame has no nested scope to focus"
+    target, parent = pairs[0]
+
+    host.profiler_set_gpu_focus([target["name"]])
+    _run_frames(40)
+    f = host.profiler_frame()
+    assert f["gpu_focus"] == [target["name"]], f
+    if f["gpu_timer"] != "elapsed":
+        pytest.skip("focus only changes anything under GL_TIME_ELAPSED")
+    by_name = {s["name"]: s for s in host.profiler_scopes()}
+    assert by_name[target["name"]]["gpu_measured"], by_name[target["name"]]
+    assert by_name[parent["name"]]["gpu_measured"], by_name[parent["name"]]
+    # The parent's segments include the focus scope's, frame by frame, and
+    # both averages blend the same frames, so the parent can never read less.
+    assert (by_name[parent["name"]]["gpu_ms"] + 1e-6
+            >= by_name[target["name"]]["gpu_ms"]), (by_name[parent["name"]],
+                                                     by_name[target["name"]])
+    # Every other nested row is still unmeasured.
+    for s in host.profiler_scopes():
+        if s["depth"] >= 2 and s["name"] != target["name"]:
+            assert not s["gpu_measured"], s
+
+
+def test_focus_keeps_the_frame_total_equal_to_the_frame_row(host, _no_focus):
+    host.profiler_set_enabled(True)
+    _run_frames(10)
+    pairs = _nested_rows_with_parents(host.profiler_scopes())
+    assert pairs
+    host.profiler_set_gpu_focus([p[0]["name"] for p in pairs])
+    _run_frames(30)
+    by_name = {s["name"]: s for s in host.profiler_scopes()}
+    total = host.profiler_frame()["gpu_ms"]
+    assert abs(total - by_name["frame"]["gpu_ms"]) <= 0.5 + 0.05 * total, (
+        total, by_name["frame"])
+
+
+def test_clearing_the_focus_restores_the_top_level_rule(host, _no_focus):
+    host.profiler_set_enabled(True)
+    _run_frames(10)
+    pairs = _nested_rows_with_parents(host.profiler_scopes())
+    assert pairs
+    host.profiler_set_gpu_focus([pairs[0][0]["name"]])
+    _run_frames(10)
+    host.profiler_set_gpu_focus([])
+    _run_frames(40)
+    if host.profiler_frame()["gpu_timer"] != "elapsed":
+        pytest.skip("only GL_TIME_ELAPSED has a top-level rule")
+    for s in host.profiler_scopes():
+        assert s["gpu_measured"] == (s["depth"] <= 1), s
+
+
+# ── Frame PNG (engine/dev_scripted_run.py screenshots) ───────────────────────
+
+def test_a_requested_frame_png_is_written_at_the_end_of_the_next_frame(
+        host, tmp_path):
+    path = tmp_path / "shot.png"
+    host.request_frame_png(str(path))
+    assert not path.exists(), "written before any frame ran"
+    _run_frames(1)
+    assert path.exists()
+    data = path.read_bytes()
+    assert data[:8] == b"\x89PNG\r\n\x1a\n"
+    # IHDR width/height: the framebuffer the frame drew.
+    import struct
+    w, h = struct.unpack(">II", data[16:24])
+    fw, fh = host.framebuffer_size()
+    assert (w, h) == (fw, fh)
+    assert w > 0 and h > 0
+    path.unlink()
+    _run_frames(2)
+    assert not path.exists(), "one request, one file"

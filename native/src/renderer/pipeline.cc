@@ -16,6 +16,8 @@
 #include "embedded_rock_speck_fs.h"
 #include "embedded_rock_puff_vs.h"
 #include "embedded_rock_puff_fs.h"
+#include "embedded_rock_puff_hash_vs.h"
+#include "embedded_rock_puff_hash_fs.h"
 #include "embedded_backdrop_vs.h"
 #include "embedded_backdrop_fs.h"
 #include "embedded_sun_vs.h"
@@ -36,6 +38,8 @@
 #include "embedded_system_nebula_fs.h"
 #include "embedded_nebula_godray_vs.h"
 #include "embedded_nebula_godray_fs.h"
+#include "embedded_nebula_godray_mask_fs.h"
+#include "embedded_nebula_godray_composite_fs.h"
 #include "embedded_shield_vs.h"
 #include "embedded_shield_fs.h"
 #include "embedded_lens_flare_vs.h"
@@ -48,6 +52,8 @@
 #include "embedded_hit_vfx_fs.h"
 #include "embedded_hull_discharge_vs.h"
 #include "embedded_hull_discharge_fs.h"
+#include "embedded_running_light_vs.h"
+#include "embedded_running_light_fs.h"
 #include "embedded_nebula_wake_vs.h"
 #include "embedded_nebula_wake_fs.h"
 #include "embedded_phaser_vs.h"
@@ -132,6 +138,11 @@ Pipeline::Pipeline() {
     speck_ = std::make_unique<Shader>(shader_src::speck_vs, shader_src::speck_fs);
     rock_speck_ = std::make_unique<Shader>(shader_src::rock_speck_vs, shader_src::rock_speck_fs);
     rock_puff_ = std::make_unique<Shader>(shader_src::rock_puff_vs, shader_src::rock_puff_fs);
+    // The puff noise's hash table lives on its own unit (FarPass binds it).
+    rock_puff_->use();
+    rock_puff_->set_int("u_puff_hash", kRockPuffHashUnit);
+    rock_puff_hash_ = std::make_unique<Shader>(shader_src::rock_puff_hash_vs,
+                                               shader_src::rock_puff_hash_fs);
     backdrop_ = std::make_unique<Shader>(shader_src::backdrop_vs, shader_src::backdrop_fs);
     sun_ = std::make_unique<Shader>(shader_src::sun_vs, shader_src::sun_fs);
     sun_flare_ = std::make_unique<Shader>(shader_src::sun_flare_vs, shader_src::sun_flare_fs);
@@ -145,12 +156,15 @@ Pipeline::Pipeline() {
     // System-scale nebula haze: same fullscreen-triangle vertex shader.
     system_nebula_ = std::make_unique<Shader>(shader_src::nebula_volumetric_vs, shader_src::system_nebula_fs);
     nebula_godray_ = std::make_unique<Shader>(shader_src::nebula_godray_vs, shader_src::nebula_godray_fs);
+    nebula_godray_mask_ = std::make_unique<Shader>(shader_src::nebula_godray_vs, shader_src::nebula_godray_mask_fs);
+    nebula_godray_composite_ = std::make_unique<Shader>(shader_src::nebula_godray_vs, shader_src::nebula_godray_composite_fs);
     shield_ = std::make_unique<Shader>(shader_src::shield_vs, shader_src::shield_fs);
     lens_flare_ = std::make_unique<Shader>(shader_src::lens_flare_vs, shader_src::lens_flare_fs);
     torpedo_    = std::make_unique<Shader>(shader_src::torpedo_vs,    shader_src::torpedo_fs);
     disruptor_  = std::make_unique<Shader>(shader_src::disruptor_vs,  shader_src::disruptor_fs);
     hit_vfx_    = std::make_unique<Shader>(shader_src::hit_vfx_vs,    shader_src::hit_vfx_fs);
     hull_discharge_ = std::make_unique<Shader>(shader_src::hull_discharge_vs, shader_src::hull_discharge_fs);
+    running_light_ = std::make_unique<Shader>(shader_src::running_light_vs, shader_src::running_light_fs);
     nebula_wake_ = std::make_unique<Shader>(shader_src::nebula_wake_vs, shader_src::nebula_wake_fs);
     phaser_        = std::make_unique<Shader>(shader_src::phaser_vs,        shader_src::phaser_fs);
     hologram_      = std::make_unique<Shader>(shader_src::hologram_vs,      shader_src::hologram_fs);

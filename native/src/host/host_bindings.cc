@@ -55,6 +55,8 @@
 #include <renderer/torpedo_pass.h>
 #include <renderer/hit_vfx_pass.h>
 #include <renderer/hull_discharge_pass.h>
+#include <renderer/running_light_pass.h>
+#include <renderer/running_light_store.h>
 #include <renderer/nebula_wake_pass.h>
 #include <renderer/shockwave_pass.h>
 #include <renderer/particle_pass.h>
@@ -140,6 +142,9 @@
 #include <unordered_map>
 #include <functional>
 #include <vector>
+
+// Pending request_frame_png path; empty = none. Read and cleared in frame().
+static std::string g_frame_png_path;
 
 namespace py = pybind11;
 
@@ -290,9 +295,7 @@ dauntless::BridgeHighlight g_bridge_highlight;
 // would drop exactly the values init() exists to apply.
 struct BridgeProbeSettings {
     glm::vec3 origin{0.0f};
-    float green = 1.0f;
-    float yellow_red = 1.0f;
-    float mix = 0.0f;
+    std::array<float, renderer::kBridgeStates> scales{1.0f, 1.0f, 1.0f, 1.0f, 1.0f};
     bool capture_pending = false;
 };
 BridgeProbeSettings g_bridge_probe;
@@ -392,8 +395,8 @@ std::vector<renderer::NebulaVolume> g_nebulae;
 std::vector<renderer::NebulaWakePoint> g_nebula_wake;   // world pos, faded strength, pod size
 std::unique_ptr<renderer::NebulaPass> g_nebula_pass;
 std::unique_ptr<renderer::NebulaVolumetricPass> g_nebula_volumetric_pass;
-// System-scale nebula (star-centred atmosphere). DEVELOPER-ONLY: frame()
-// runs it only under --developer with Volumetric Nebulae on.
+// System-scale nebula (star-centred atmosphere). On in production: frame()
+// runs it whenever Volumetric Nebulae is on and a profile is pushed.
 std::unique_ptr<renderer::SystemNebulaPass> g_system_nebula_pass;
 std::vector<renderer::GodrayFlash> g_nebula_godrays;
 std::unique_ptr<renderer::NebulaGodrayPass> g_nebula_godray_pass;
@@ -412,6 +415,13 @@ std::vector<renderer::HitVfxDescriptor>    g_hit_vfx;
 std::unique_ptr<renderer::HitVfxPass>      g_hit_vfx_pass;
 std::vector<renderer::HullDischarge>       g_hull_discharges;
 std::unique_ptr<renderer::HullDischargePass> g_hull_discharge_pass;
+
+// Ship running lights (running-lights spec §4.4). The store is per-instance
+// and Python-fed at spawn; levels arrive every frame.
+renderer::RunningLightStore                  g_running_lights;
+renderer::RunningLightDials                  g_running_light_dials;
+bool                                         g_running_lights_enabled = true;
+std::unique_ptr<renderer::RunningLightPass>  g_running_light_pass;
 std::unique_ptr<renderer::NebulaWakePass> g_nebula_wake_pass;
 std::vector<renderer::ParticleEmitterDescriptor> g_particle_emitters;
 std::unique_ptr<renderer::ParticlePass>          g_particle_pass;
@@ -650,28 +660,79 @@ bool bridge_finite3(const glm::vec3& a) {
     return std::isfinite(a.x) && std::isfinite(a.y) && std::isfinite(a.z);
 }
 
-// Parses the optional per-light probe-capture colour pairs shared by
-// set_bridge_spots and set_bridge_area_lights (spec 2026-10-08-bridge-emitters
-// §11.4 / §16.3): [(green3, yellow/red3)] in the same order as the light rows.
-// Returns an empty vector for None, a cast failure, or a length mismatch
-// against `n` -- in every one of those cases the caller's rule is "no
-// captures: the probes see the live colour", so an empty return means exactly
-// that to both bindings.
-std::vector<std::pair<glm::vec3, glm::vec3>> parse_bridge_captures(
-    py::object captures, std::size_t n) {
-    std::vector<std::pair<glm::vec3, glm::vec3>> caps;
-    if (captures.is_none()) return caps;
+// One light's per-state probe-capture data (spec 2026-10-17 §4.1): five
+// LINEAR colours in state order (what the base probe of each state sees),
+// the animation layer each state's member belongs to (-1 = none) and the
+// at-peak colour it adds to that layer.
+struct BridgeCaptureRow {
+    glm::vec3 caps[renderer::kBridgeStates] = {};
+    int layers[renderer::kBridgeStates] = {-1, -1, -1, -1, -1};
+    glm::vec3 layer_rgbs[renderer::kBridgeStates] = {};
+};
+
+using BridgeV3 = std::tuple<float, float, float>;
+
+// Parses one (caps5, layers5, layer_rgbs5) triple, shared by the light rows
+// and the glow rows. False on a cast failure or any list not of length 5.
+bool parse_bridge_capture_row(py::handle item, BridgeCaptureRow* out) {
+    try {
+        auto t = item.cast<std::tuple<std::vector<BridgeV3>, std::vector<int>,
+                                      std::vector<BridgeV3>>>();
+        const auto& caps = std::get<0>(t);
+        const auto& layers = std::get<1>(t);
+        const auto& rgbs = std::get<2>(t);
+        const std::size_t n = static_cast<std::size_t>(renderer::kBridgeStates);
+        if (caps.size() != n || layers.size() != n || rgbs.size() != n) return false;
+        for (std::size_t i = 0; i < n; ++i) {
+            out->caps[i] = bridge_v3(caps[i]);
+            out->layers[i] = layers[i];
+            out->layer_rgbs[i] = bridge_v3(rgbs[i]);
+        }
+        return true;
+    } catch (const py::cast_error&) {
+        return false;
+    }
+}
+
+// Parses the optional per-light probe-capture rows shared by set_bridge_spots
+// and set_bridge_area_lights (spec 2026-10-08-bridge-emitters §11.4 / §16.3,
+// 2026-10-17 §4.1): one (caps5, layers5, layer_rgbs5) per light row, in row
+// order. Returns an empty vector for None, a cast failure, or a length
+// mismatch against `n` -- in every one of those cases the caller's rule is
+// "no captures: the probes see the live colour", so an empty return means
+// exactly that to both bindings.
+std::vector<BridgeCaptureRow> parse_bridge_captures(py::object captures, std::size_t n) {
+    std::vector<BridgeCaptureRow> rows;
+    if (captures.is_none()) return rows;
     try {
         for (auto item : captures) {
-            auto pr = item.cast<std::tuple<std::tuple<float, float, float>,
-                                           std::tuple<float, float, float>>>();
-            caps.emplace_back(bridge_v3(std::get<0>(pr)), bridge_v3(std::get<1>(pr)));
+            BridgeCaptureRow r;
+            if (!parse_bridge_capture_row(item, &r)) return {};
+            rows.push_back(r);
         }
-    } catch (const py::cast_error&) {
+    } catch (const py::error_already_set&) {
         return {};
     }
-    if (caps.size() != n) return {};
-    return caps;
+    if (rows.size() != n) return {};
+    return rows;
+}
+
+// True when every colour of the row, scaled by `k`, is finite.
+bool bridge_capture_finite(const BridgeCaptureRow& r, float k) {
+    for (int i = 0; i < renderer::kBridgeStates; ++i)
+        if (!bridge_finite3(r.caps[i] * k) || !bridge_finite3(r.layer_rgbs[i] * k)) return false;
+    return true;
+}
+
+// Copies a parsed row onto a light's capture fields, colours x `k`.
+template <typename Light>
+void apply_bridge_capture(Light& l, const BridgeCaptureRow& r, float k) {
+    l.has_capture = true;
+    for (int i = 0; i < renderer::kBridgeStates; ++i) {
+        l.capture_radiance[i] = r.caps[i] * k;
+        l.layer[i] = r.layers[i];
+        l.layer_radiance[i] = r.layer_rgbs[i] * k;
+    }
 }
 
 // Tracks key state from the previous frame() so key_pressed can detect
@@ -939,6 +1000,7 @@ void reset_frame_state() {
     g_dynamic_lights.clear();
     g_lens_flares.clear();
     g_hull_discharges.clear();
+    g_running_lights.clear();
     g_cloak_ships.clear();
     g_subsystem_pins.clear();
     g_debug_cylinders.clear();
@@ -1093,6 +1155,7 @@ void init(int width, int height, const std::string& title) {
     g_torpedo_pass = std::make_unique<renderer::TorpedoPass>();
     g_hit_vfx_pass = std::make_unique<renderer::HitVfxPass>();
     g_hull_discharge_pass = std::make_unique<renderer::HullDischargePass>();
+    g_running_light_pass = std::make_unique<renderer::RunningLightPass>();
     g_nebula_wake_pass = std::make_unique<renderer::NebulaWakePass>();
     g_particle_pass = std::make_unique<renderer::ParticlePass>();
     g_phaser_pass        = std::make_unique<renderer::PhaserPass>();
@@ -1116,8 +1179,7 @@ void init(int width, int height, const std::string& title) {
     g_bridge_pass->set_alert_ambient_scale(g_bridge_ambient_scale);
     g_bridge_pass->set_alert_level(g_bridge_alert_level);
     g_bridge_pass->set_probe_origin(g_bridge_probe.origin);
-    g_bridge_pass->set_probe_scales(g_bridge_probe.green, g_bridge_probe.yellow_red);
-    g_bridge_pass->set_probe_mix(g_bridge_probe.mix);
+    g_bridge_pass->set_probe_scales(g_bridge_probe.scales);
     if (g_bridge_probe.capture_pending) g_bridge_pass->request_probe_capture();
     g_bridge_probe.capture_pending = false;
     g_viewscreen_static_pass = std::make_unique<renderer::ViewscreenStaticPass>();
@@ -1187,6 +1249,7 @@ void shutdown() {
     g_shockwave_pass.reset();
     g_hit_vfx_pass.reset();
     g_hull_discharge_pass.reset();
+    g_running_light_pass.reset();
     g_nebula_wake_pass.reset();
     g_particle_pass.reset();
     g_phaser_pass.reset();
@@ -1585,13 +1648,22 @@ void frame() {
             in.anchor_sys = g_far_field.anchor();
             in.game_time = g_decal_game_time;
             in.lod0_pixel_radius = g_minor_field.dials().lod0_pixel_radius;
-            g_near_field.build(in, g_near_out);
-            g_minor_pass->render(near_fragment, g_near_out.meshes, cam, *g_pipeline,
-                                 [](std::uint64_t h) { return resolve_model(h); },
-                                 g_lighting, ambient_scale, rim);
+            {
+                DAUNTLESS_FRAME_SCOPE("rock.near.build");
+                g_near_field.build(in, g_near_out);
+            }
+            {
+                DAUNTLESS_FRAME_SCOPE("rock.near.mesh_draw");
+                g_minor_pass->render(near_fragment, g_near_out.meshes, cam, *g_pipeline,
+                                     [](std::uint64_t h) { return resolve_model(h); },
+                                     g_lighting, ambient_scale, rim);
+            }
             g_far_draw_calls += g_minor_pass->last_draw_calls();
-            g_far_pass->render_impostors(g_near_out.billboards, cam, *g_pipeline, g_lighting,
-                                         ambient_scale, rim);
+            {
+                DAUNTLESS_FRAME_SCOPE("rock.impostor.draw");
+                g_far_pass->render_impostors(g_near_out.billboards, cam, *g_pipeline, g_lighting,
+                                             ambient_scale, rim);
+            }
             // billboards_fading draw translucent in render_space_vfx (rock.fade.draw).
             // A billboard bin whose atlas cannot load is skipped by
             // render_impostors (its rock still draws in the mesh tier); the
@@ -1765,14 +1837,13 @@ void frame() {
                                                  g_lighting, ambient_scale, rim);
             g_far_draw_calls += g_far_pass->last_draw_calls();
         }
-        // System-scale nebula: developer-only. Without --developer (or with
-        // Volumetric Nebulae off) the legacy branch runs exactly as before.
+        // System-scale nebula: follows the Volumetric Nebulae setting. With it
+        // off (or no profile pushed) the legacy branch runs.
         const renderer::NebulaDrawPlan neb_plan = renderer::plan_nebula_draws(
             dauntless_volumetric_nebulae::enabled(),
-            dauntless::is_developer_mode() && g_system_nebula_pass != nullptr,
             g_system_nebula_pass && g_system_nebula_pass->has_profile(),
             !g_nebulae.empty(), !g_nebula_wake.empty());
-        if (neb_plan.system) {
+        if (neb_plan.system && g_system_nebula_pass) {
             DAUNTLESS_FRAME_SCOPE("space.system_nebula");
             const glm::mat4 inv_vp =
                 glm::inverse(cam.proj_matrix() * cam.view_matrix());
@@ -1806,7 +1877,8 @@ void frame() {
         if (dauntless_nebula_lightning::enabled()
                 && g_nebula_godray_pass && !g_nebula_godrays.empty())
             g_nebula_godray_pass->render(cam, *g_pipeline, g_nebula_godrays,
-                                         target.color_texture());
+                                         target.color_texture(),
+                                         target.depth_texture());
         if (g_lens_flare_pass) {
             DAUNTLESS_FRAME_SCOPE("space.lens_flare");
             g_lens_flare_pass->render(g_lens_flares, cam, *g_pipeline, vw, vh, now);
@@ -1817,6 +1889,13 @@ void frame() {
             if (g_phaser_pass)  g_phaser_pass ->render(g_phaser_beams, cam, *g_pipeline);
             if (g_phaser_pass)  g_phaser_pass ->render(g_tractor_beams, cam, *g_pipeline);
             if (g_hit_vfx_pass) g_hit_vfx_pass->render(g_hit_vfx, g_world, cam, *g_pipeline);
+        }
+        if (g_running_lights_enabled && g_running_light_pass && g_running_lights.size() > 0) {
+            DAUNTLESS_FRAME_SCOPE("space.running_lights");
+            const auto sprites = g_running_lights.build_sprites(
+                g_world, g_decal_game_time, g_running_light_dials,
+                cam.eye, cam.proj_matrix()[1][1], vh);
+            g_running_light_pass->render(cam, *g_pipeline, sprites);
         }
         if (dauntless_nebula_lightning::enabled()
                 && g_hull_discharge_pass && !g_hull_discharges.empty())
@@ -2372,11 +2451,21 @@ void frame() {
         dauntless::ui_cef::pump();
     }
     {
-        // The composite uploads the ENTIRE CEF surface every frame — no
-        // dirty-rect, no PBO — so this scope carries that cost. At 2560x1440
-        // BGRA that is ~14.7 MB of synchronous glTexSubImage2D per frame.
+        // By default the composite uploads the ENTIRE CEF surface every
+        // frame — no dirty-rect, no PBO. At 2560x1440 BGRA that is ~14.7 MB
+        // of glTexSubImage2D per frame. Upload and draw are timed separately
+        // because the upload is where the CPU appears to wait for the GPU
+        // (docs/engine/perf-register.md, A-1); DAUNTLESS_CEF_UPLOAD switches
+        // the upload policy for that experiment.
         DAUNTLESS_FRAME_SCOPE("cef.composite");
-        dauntless::ui_cef::composite();
+        {
+            DAUNTLESS_FRAME_SCOPE("cef.upload");
+            dauntless::ui_cef::composite_upload();
+        }
+        {
+            DAUNTLESS_FRAME_SCOPE("cef.draw");
+            dauntless::ui_cef::composite_draw();
+        }
     }
 #endif
 
@@ -2400,6 +2489,18 @@ void frame() {
         } else {
             std::fprintf(stderr, "[nonfinite] FAILED to write %s\n", path.c_str());
         }
+    }
+
+    // A requested frame PNG (request_frame_png): the finished frame, overlay
+    // included, read from the back buffer before the swap makes it undefined.
+    if (!g_frame_png_path.empty()) {
+        if (dauntless::dump_default_framebuffer_png(g_frame_png_path, fw, fh))
+            std::fprintf(stderr, "[frame-png] wrote %s (%dx%d)\n",
+                         g_frame_png_path.c_str(), fw, fh);
+        else
+            std::fprintf(stderr, "[frame-png] FAILED to write %s\n",
+                         g_frame_png_path.c_str());
+        g_frame_png_path.clear();
     }
 
     {
@@ -2442,6 +2543,35 @@ namespace dauntless_normal_map {
 // Hull-breach renderer pass — always-on gate. Defined in frame.cc.
 namespace dauntless_hull_damage {
     bool enabled();            // defined in frame.cc
+}
+
+/// The dict -> (profile, look) parse shared by set_system_nebula_profile,
+/// system_nebula_prebuild and system_nebula_prebuilt, so all three key the
+/// table cache identically. Throws ValueError on mismatched rows.
+static std::pair<renderer::atmosphere::RadialProfile,
+                 renderer::atmosphere::LookParams>
+parse_system_nebula_profile(const py::dict& d) {
+    renderer::atmosphere::RadialProfile p;
+    p.r = d["r"].cast<std::vector<float>>();
+    p.nebula = d["nebula"].cast<std::vector<float>>();
+    if (p.r.empty() || p.r.size() != p.nebula.size())
+        throw py::value_error(
+            "system nebula profile: 'r' and 'nebula' must be "
+            "non-empty and the same length");
+    p.k_sys = d["k_sys"].cast<float>();
+    p.star_radius = d["star_radius"].cast<float>();
+    auto rgb3 = [&](const char* key) {
+        auto t = d[key].cast<std::tuple<float, float, float>>();
+        return glm::vec3(std::get<0>(t), std::get<1>(t), std::get<2>(t));
+    };
+    p.cloud_rgb = rgb3("cloud_rgb");
+    p.star_rgb = rgb3("star_rgb");
+    renderer::atmosphere::LookParams look;
+    if (d.contains("g"))       look.g = d["g"].cast<float>();
+    if (d.contains("floor"))   look.floor = d["floor"].cast<float>();
+    if (d.contains("scatter")) look.scatter = d["scatter"].cast<float>();
+    if (d.contains("far_gu"))  look.far_gu = d["far_gu"].cast<float>();
+    return {std::move(p), look};
 }
 
 static renderer::PhaserBeamDescriptor beam_from_dict(const py::dict& d) {
@@ -3101,6 +3231,13 @@ PYBIND11_MODULE(_dauntless_host, m) {
           "renderer textures (the collision-scuff normal map) resolve against "
           "this, never the BC install. Pushed at boot beside set_game_root.");
 
+    m.def("prewarm_scuff_normal_texture",
+          []() { renderer::ensure_scuff_normal_texture(); },
+          "Load the collision-scuff normal map now rather than on the first "
+          "scuff drawn: 12.6 MB, ~0.6 s in that frame in Debug "
+          "(perf-register P-11). Call after set_project_asset_root, with the "
+          "GL context current.");
+
     m.def("set_asset_overrides",
           [](const std::map<std::string, std::string>& overrides) {
               renderer::set_asset_overrides(overrides);
@@ -3168,8 +3305,12 @@ PYBIND11_MODULE(_dauntless_host, m) {
                   g_render_origin.x, g_render_origin.y, g_render_origin.z);
               d["dust_motion_history"] =
                   g_dust_pass ? g_dust_pass->has_motion_history() : false;
-              d["nebula_history"] = g_nebula_volumetric_pass
-                  ? g_nebula_volumetric_pass->has_history() : false;
+              // The legacy volumetric pass only; the system pass (which draws
+              // the volumes with Volumetric Nebulae on) keeps no history
+              // since 2026-10-19.
+              d["nebula_history"] =
+                  g_nebula_volumetric_pass
+                  && g_nebula_volumetric_pass->has_history();
               d["letterbox_covered"]      = renderer::letterbox::covered();
               d["sky_dirty"]              = g_sky_dirty;
               d["prev_input_edges"]       = g_prev_key_state.size()
@@ -3233,6 +3374,7 @@ PYBIND11_MODULE(_dauntless_host, m) {
               const bool was_valid = g_world.is_valid(id);
               g_world.destroy_instance(id);
               if (was_valid) {
+                  g_running_lights.erase(id);
                   // Purge any bridge node-anim state keyed on this index BEFORE
                   // it can be recycled by a new instance in the same Python step
                   // (the lazy per-frame sweep in update_bridge_node_anims runs
@@ -3294,8 +3436,6 @@ PYBIND11_MODULE(_dauntless_host, m) {
               if (g_dust_pass) g_dust_pass->reset_motion_history();
               if (g_nebula_volumetric_pass)
                   g_nebula_volumetric_pass->reset_history();
-              if (g_system_nebula_pass)
-                  g_system_nebula_pass->reset_history();
               g_have_prev_viewproj = false;
           },
           "Reset the floating render origin to (0,0,0) for a new mission, and "
@@ -3693,6 +3833,25 @@ PYBIND11_MODULE(_dauntless_host, m) {
           "somewhere in its subtree, bounds in SHIP units. `candidate` marks "
           "the nodes a human would call a part (renderer::model_parts).");
 
+    m.def("model_nearest_part",
+          [](scenegraph::ModelHandle h,
+             std::tuple<float, float, float> point) -> std::string {
+              // SHIP units in, like model_nodes' bounds out.
+              constexpr float kShipToModel = 100.0f;
+              const assets::Model* model = resolve_model(h);
+              if (model == nullptr) return "";
+              const glm::vec3 p(std::get<0>(point) * kShipToModel,
+                                std::get<1>(point) * kShipToModel,
+                                std::get<2>(point) * kShipToModel);
+              return renderer::nearest_model_part(*model, p);
+          },
+          py::arg("model"), py::arg("point"),
+          "The candidate part (renderer::model_parts) whose rest-pose "
+          "triangles lie nearest `point` (SHIP units, rest pose), or '' when "
+          "the model is not loaded or has no part geometry. Which part an "
+          "AUTHORED point -- a hardpoint mount, an emitter or running light -- "
+          "is on; see part_severance.part_for_mount.");
+
     // ── Per-instance decal override (SPV live preview) ───────────────────
     // Spec 2026-09-28-spv-decal-editing-design.md §2.5. Never throws: a bad
     // entry is skipped (warned once), an unknown id / a host that is down is
@@ -3967,7 +4126,7 @@ PYBIND11_MODULE(_dauntless_host, m) {
                   a.limb = t[4].cast<float>();
                   // intensity (shell-halo brightness multiplier only) is an
                   // OPTIONAL 6th element added after this binding shipped;
-                  // a 5-tuple caller keeps the struct default (20.0).
+                  // a 5-tuple caller keeps the struct default (9.0).
                   if (t.size() >= 6) a.intensity = t[5].cast<float>();
                   // mie (grey Mie strength) is an OPTIONAL 7th element;
                   // 5- and 6-tuple callers keep the struct default (0.2).
@@ -3978,7 +4137,7 @@ PYBIND11_MODULE(_dauntless_host, m) {
           py::arg("id"), py::arg("params"),
           "Planet atmosphere (spec 2026-10-07): None disables; else "
           "(color, sunset_color, thickness, density, limb[, intensity[, mie]]), "
-          "colours linear RGB; intensity defaults to 20.0 and mie to 0.2 "
+          "colours linear RGB; intensity defaults to 9.0 and mie to 0.2 "
           "when omitted.");
     m.def("set_instance_surface",
           [](scenegraph::InstanceId id, py::object params) {
@@ -4484,7 +4643,7 @@ PYBIND11_MODULE(_dauntless_host, m) {
     m.def("set_bridge_debug_view",
           [](int v) {
               if (!dauntless::is_developer_mode()) return;
-              v = std::clamp(v, 0, 10);
+              v = std::clamp(v, 0, 11);
               g_bridge_debug_view = v;
               if (g_bridge_pass)
                   g_bridge_pass->set_debug_view(
@@ -4494,8 +4653,8 @@ PYBIND11_MODULE(_dauntless_host, m) {
           "DEV ONLY (--developer; no-op otherwise): Developer Options -> "
           "Lighting tab's Bridge Debug View row. 0 Off, 1 Normals, "
           "2 Light Only, 3 AO Only, 4 Triangle ID, 5 Mesh ID, 6 Roughness, "
-          "7 Metalness, 8 Specular Only, 9 Probe Mirror, 10 Map Normals "
-          "(6-10 show only where bridge PBR runs).");
+          "7 Metalness, 8 Specular Only, 9 Probe Mirror, 10 Map Normals, "
+          "11 Reflection Layers (6-11 show only where bridge PBR runs).");
 
     // Bridge PBR per-shape material overrides (spec 2026-10-08-bridge-emitters
     // §9.2 source B). Production data: NOT developer-gated. None / stale clears.
@@ -4542,7 +4701,7 @@ PYBIND11_MODULE(_dauntless_host, m) {
               // colours (green, yellow/red), in input order, x that spot's
               // intensity. A length mismatch ignores them (the PBR-step rule:
               // the captures see the radiance).
-              const std::vector<std::pair<glm::vec3, glm::vec3>> caps =
+              const std::vector<BridgeCaptureRow> caps =
                   parse_bridge_captures(captures, spots.size());
               std::vector<renderer::BridgeSpot> v;
               v.reserve(spots.size());
@@ -4556,8 +4715,7 @@ PYBIND11_MODULE(_dauntless_host, m) {
                       !std::isfinite(inner_deg) || !std::isfinite(outer_deg) ||
                       !std::isfinite(range) || !std::isfinite(intensity) ||
                       !bridge_finite3(bridge_v3(rgb) * intensity) ||
-                      (!caps.empty() && (!bridge_finite3(caps[i].first * intensity) ||
-                                         !bridge_finite3(caps[i].second * intensity)))) {
+                      (!caps.empty() && !bridge_capture_finite(caps[i], intensity))) {
                       ++invalid;
                       continue;
                   }
@@ -4576,11 +4734,7 @@ PYBIND11_MODULE(_dauntless_host, m) {
                   sp.cos_outer = std::cos(glm::radians(outer));
                   sp.range = std::max(range, 0.0f);
                   sp.radiance = bridge_v3(rgb) * intensity;
-                  if (!caps.empty()) {
-                      sp.has_capture = true;
-                      sp.capture_radiance[0] = caps[i].first * intensity;
-                      sp.capture_radiance[1] = caps[i].second * intensity;
-                  }
+                  if (!caps.empty()) apply_bridge_capture(sp, caps[i], intensity);
                   v.push_back(sp);
               }
               const std::size_t cap = static_cast<std::size_t>(renderer::kBridgeMaxSpots);
@@ -4627,7 +4781,7 @@ PYBIND11_MODULE(_dauntless_host, m) {
                                           std::tuple<float, float, float>,
                                           float>>& areas,
              py::object captures, py::object joins) -> std::size_t {
-              const std::vector<std::pair<glm::vec3, glm::vec3>> caps =
+              const std::vector<BridgeCaptureRow> caps =
                   parse_bridge_captures(captures, areas.size());
               // Spec §16.8: per-row join bits (pbr::area_join_weight), in
               // input order; anything unusable means no joins.
@@ -4652,8 +4806,7 @@ PYBIND11_MODULE(_dauntless_host, m) {
                       !std::isfinite(range) || !(range > 0.0f) || !std::isfinite(intensity) ||
                       !bridge_finite3(bridge_v3(rgb) * intensity) ||
                       !(glm::length(glm::cross(hu, hv)) >= 1e-8f) ||
-                      (!caps.empty() && (!bridge_finite3(caps[i].first * intensity) ||
-                                         !bridge_finite3(caps[i].second * intensity)))) {
+                      (!caps.empty() && !bridge_capture_finite(caps[i], intensity))) {
                       ++invalid;
                       continue;
                   }
@@ -4663,11 +4816,7 @@ PYBIND11_MODULE(_dauntless_host, m) {
                   al.half_v = hv;
                   al.range = range;
                   al.radiance = bridge_v3(rgb) * intensity;
-                  if (!caps.empty()) {
-                      al.has_capture = true;
-                      al.capture_radiance[0] = caps[i].first * intensity;
-                      al.capture_radiance[1] = caps[i].second * intensity;
-                  }
+                  if (!caps.empty()) apply_bridge_capture(al, caps[i], intensity);
                   if (!join_bits.empty()) al.joins = join_bits[i] & 3;
                   v.push_back(al);
               }
@@ -4748,38 +4897,124 @@ PYBIND11_MODULE(_dauntless_host, m) {
           "(the captain's-chair eye). Takes effect at the next capture.");
 
     m.def("set_bridge_probe_scales",
-          [](float green, float yellow_red) {
-              g_bridge_probe.green = green;
-              g_bridge_probe.yellow_red = yellow_red;
-              if (g_bridge_pass) g_bridge_pass->set_probe_scales(green, yellow_red);
+          [](const std::vector<float>& scales) {
+              if (scales.size() != static_cast<std::size_t>(renderer::kBridgeStates))
+                  throw py::value_error("set_bridge_probe_scales needs 5 values");
+              for (int i = 0; i < renderer::kBridgeStates; ++i)
+                  g_bridge_probe.scales[static_cast<std::size_t>(i)] =
+                      scales[static_cast<std::size_t>(i)];
+              if (g_bridge_pass) g_bridge_pass->set_probe_scales(g_bridge_probe.scales);
           },
-          py::arg("green"), py::arg("yellow_red"),
-          "Ambient multipliers the green and yellow/red probes are captured "
-          "with (x the bridge lighting's ambient). Take effect at the next "
-          "capture.");
+          py::arg("scales"),
+          "Ambient multipliers the five state probes (green, yellow, red, "
+          "offline, special) are captured with (x the bridge lighting's "
+          "ambient). Take effect at the next capture.");
 
-    m.def("set_bridge_probe_mix",
-          [](float t) {
-              g_bridge_probe.mix = std::isfinite(t) ? std::clamp(t, 0.0f, 1.0f) : 0.0f;
-              if (g_bridge_pass) g_bridge_pass->set_probe_mix(g_bridge_probe.mix);
+    m.def("set_bridge_probe_layers",
+          [](const std::vector<int>& states,
+             const std::vector<std::uint64_t>& identities) -> std::size_t {
+              if (identities.size() != states.size())
+                  throw py::value_error(
+                      "set_bridge_probe_layers needs one identity per state");
+              if (!g_bridge_pass) return 0;
+              return g_bridge_pass->set_probe_layers(states, identities);
           },
-          py::arg("t"),
-          "Reflection cross-fade: 0 = the green probe, 1 = the yellow/red "
-          "probe. Clamped to [0, 1].");
+          py::arg("states"), py::arg("identities"),
+          "The state each animation layer's probe belongs to (spec 2026-10-17 "
+          "§4.4), layer k = probe 5+k, and each layer's identity (a stable "
+          "uint64 of its state and wave key): a layer whose identity at its "
+          "index changed reads as absent until its own capture lands. States "
+          "outside 0-4 are dropped with their identity; returns how many. "
+          "Raises ValueError when the lists differ in length; otherwise a "
+          "no-op before init.");
+
+    m.def("set_bridge_glow_captures",
+          [](py::object instance_id, py::object rows) {
+              if (!g_bridge_pass) return;
+              scenegraph::Instance* inst = nullptr;
+              if (!instance_id.is_none()) {
+                  try {
+                      inst = g_world.get(instance_id.cast<scenegraph::InstanceId>());
+                  } catch (const py::cast_error&) {
+                      inst = nullptr;   // not an InstanceId: treated as stale
+                  }
+              }
+              if (inst == nullptr) { g_bridge_pass->clear_glow_captures(); return; }
+              std::vector<renderer::BridgeGlowCapture> v;
+              try {
+                  for (auto item : rows) {
+                      auto t = item.cast<std::tuple<int, int, std::vector<BridgeV3>,
+                                                    std::vector<int>, std::vector<BridgeV3>>>();
+                      const auto& caps = std::get<2>(t);
+                      const auto& layers = std::get<3>(t);
+                      const auto& rgbs = std::get<4>(t);
+                      const std::size_t n = static_cast<std::size_t>(renderer::kBridgeStates);
+                      const int src = std::get<1>(t);
+                      if (caps.size() != n || layers.size() != n || rgbs.size() != n ||
+                          src < 0 || src > 2)
+                          continue;
+                      renderer::BridgeGlowCapture gc;
+                      gc.mesh = std::get<0>(t);
+                      gc.src = src;
+                      bool finite = true;
+                      for (std::size_t i = 0; i < n; ++i) {
+                          gc.base[i] = bridge_v3(caps[i]);
+                          gc.layer[i] = layers[i];
+                          gc.layer_rgb[i] = bridge_v3(rgbs[i]);
+                          finite = finite && bridge_finite3(gc.base[i]) &&
+                                   bridge_finite3(gc.layer_rgb[i]);
+                      }
+                      if (finite) v.push_back(gc);
+                  }
+              } catch (const py::cast_error&) {
+                  g_bridge_pass->clear_glow_captures();
+                  return;
+              }
+              g_bridge_pass->set_glow_captures(inst->model_handle, std::move(v));
+          },
+          py::arg("instance_id"), py::arg("rows"),
+          "Per-mesh glow contribution to the probes (spec 2026-10-17 §4.5): "
+          "[(mesh, src, caps5, layers5, layer_rgbs5)], display space (the pass "
+          "decodes). None or a stale id clears; non-finite rows are dropped. "
+          "Signature input only; never raises.");
+
+    m.def("set_bridge_probe_state",
+          [](int state, float dt) {
+              // Spec 2026-10-17 §4.2: the base cross-fade runs in the pass.
+              // No pass yet: nothing to fade, the next frame pushes again.
+              if (g_bridge_pass) g_bridge_pass->set_probe_state(state, dt);
+          },
+          py::arg("state"), py::arg("dt"),
+          "Shown bridge state (0-4) and the paused-aware bridge dt; the pass "
+          "cross-fades the base probe weights (dt <= 0 freezes). Never raises.");
+
+    m.def("set_bridge_layer_values",
+          [](const std::vector<float>& values) {
+              std::vector<float> v;
+              v.reserve(values.size());
+              for (float x : values)
+                  v.push_back(std::isfinite(x) ? std::clamp(x, 0.0f, 1.0f) : 0.0f);
+              if (g_bridge_pass) g_bridge_pass->set_layer_values(std::move(v));
+          },
+          py::arg("values"),
+          "Live value per reflection layer (w^2.2), clamped to [0, 1]; "
+          "non-finite -> 0. Never raises.");
 
     m.def("bridge_probe_stash",
           [] {
               py::dict d;
               const glm::vec3 o = g_bridge_probe.origin;
               d["origin"] = py::make_tuple(o.x, o.y, o.z);
-              d["scales"] = py::make_tuple(g_bridge_probe.green, g_bridge_probe.yellow_red);
-              d["mix"] = g_bridge_probe.mix;
+              py::tuple sc(renderer::kBridgeStates);
+              for (int i = 0; i < renderer::kBridgeStates; ++i)
+                  sc[static_cast<std::size_t>(i)] = g_bridge_probe.scales[static_cast<std::size_t>(i)];
+              d["scales"] = sc;
               d["capture_pending"] = g_bridge_probe.capture_pending;
               return d;
           },
           "Read-only test snapshot of the process-wide probe stash the "
           "set_bridge_probe_* bindings write (it survives shutdown()/init() by "
-          "design): origin, scales, mix, capture_pending.");
+          "design): origin, scales, capture_pending.");
 
     m.def("bridge_probe_state",
           []() -> py::object {
@@ -4787,28 +5022,49 @@ PYBIND11_MODULE(_dauntless_host, m) {
               py::dict d;
               const glm::vec3 o = g_bridge_pass->probe_origin();
               d["origin"] = py::make_tuple(o.x, o.y, o.z);
-              d["scales"] = py::make_tuple(g_bridge_pass->probe_scale_green(),
-                                           g_bridge_pass->probe_scale_yellow_red());
-              d["mix"] = g_bridge_pass->probe_mix();
-              d["capture_pending"] = g_bridge_pass->probe_capture_pending();
+              py::tuple sc(renderer::kBridgeStates);
+              for (int i = 0; i < renderer::kBridgeStates; ++i)
+                  sc[static_cast<std::size_t>(i)] = g_bridge_pass->probe_scale(i);
+              d["scales"] = sc;
+              d["probe_count"] = g_bridge_pass->probe_count();
+              d["capture_pending"] = !g_bridge_pass->probes_settled();
               d["probes_valid"] = g_bridge_pass->probes_valid();
               d["alert_ambient_scale"] = g_bridge_pass->alert_ambient_scale();
               d["alert_level"] = g_bridge_pass->alert_level();
+              py::tuple bw(renderer::kBridgeStates);
+              for (int i = 0; i < renderer::kBridgeStates; ++i)
+                  bw[static_cast<std::size_t>(i)] = g_bridge_pass->base_weight(i);
+              d["base_weights"] = bw;
               return d;
           },
-          "Test/diagnostic snapshot of the bridge pass's probe state (origin, "
-          "scales, mix, capture_pending, probes_valid, alert_ambient_scale, "
-          "alert_level); "
-          "None before init().");
+          "Test/diagnostic snapshot of the bridge pass's probe state: origin, "
+          "scales, probe_count (5 bases + one per layer), capture_pending "
+          "(the time-sliced capture queue has work or a probe in flight), "
+          "probes_valid (the shown state's base holds a capture), "
+          "alert_ambient_scale, alert_level, base_weights (each state base's "
+          "cross-fade weight); None before init().");
+
+    m.def("bridge_probe_signatures",
+          []() -> py::object {
+              if (!g_bridge_pass) return py::none();
+              py::list l;
+              for (int i = 0; i < g_bridge_pass->probe_count(); ++i)
+                  l.append(py::int_(g_bridge_pass->probe_signature(i)));
+              return l;
+          },
+          "Test/diagnostic: the input signature of every probe (kBridgeStates "
+          "bases, then one per layer); None before init().");
 
     m.def("request_bridge_probe_capture",
           [] {
               if (g_bridge_pass) g_bridge_pass->request_probe_capture();
               else g_bridge_probe.capture_pending = true;
           },
-          "Recapture both bridge reflection probes inside the next main-bridge "
-          "frame (bridge load). Override and spot changes dirty the probes by "
-          "themselves. Never per frame.");
+          "Recapture every bridge reflection probe, time-sliced over the "
+          "following main-bridge frames (bridge load); nothing is captured "
+          "before the first request. Afterwards an input change (spots, "
+          "overrides, scales, ...) queues the probes it touches by itself. "
+          "Never per frame.");
 
     m.def("bridge_debug_view",
           [] { return g_bridge_debug_view; },
@@ -4943,27 +5199,8 @@ PYBIND11_MODULE(_dauntless_host, m) {
                   if (g_system_nebula_pass) g_system_nebula_pass->clear_profile();
                   return;
               }
-              const py::dict d = desc.cast<py::dict>();
-              renderer::atmosphere::RadialProfile p;
-              p.r = d["r"].cast<std::vector<float>>();
-              p.nebula = d["nebula"].cast<std::vector<float>>();
-              if (p.r.empty() || p.r.size() != p.nebula.size())
-                  throw py::value_error(
-                      "set_system_nebula_profile: 'r' and 'nebula' must be "
-                      "non-empty and the same length");
-              p.k_sys = d["k_sys"].cast<float>();
-              p.star_radius = d["star_radius"].cast<float>();
-              auto rgb3 = [&](const char* key) {
-                  auto t = d[key].cast<std::tuple<float, float, float>>();
-                  return glm::vec3(std::get<0>(t), std::get<1>(t), std::get<2>(t));
-              };
-              p.cloud_rgb = rgb3("cloud_rgb");
-              p.star_rgb = rgb3("star_rgb");
-              renderer::atmosphere::LookParams look;
-              if (d.contains("g"))       look.g = d["g"].cast<float>();
-              if (d.contains("floor"))   look.floor = d["floor"].cast<float>();
-              if (d.contains("scatter")) look.scatter = d["scatter"].cast<float>();
-              if (d.contains("far_gu"))  look.far_gu = d["far_gu"].cast<float>();
+              const auto [p, look] =
+                  parse_system_nebula_profile(desc.cast<py::dict>());
               // Validated above even with the host down; the upload needs GL.
               if (!g_system_nebula_pass) return;
               g_system_nebula_pass->set_profile(p, look);
@@ -4972,8 +5209,31 @@ PYBIND11_MODULE(_dauntless_host, m) {
           "Set (dict) or clear (None) the system-scale nebula profile: keys "
           "r, nebula (lists, GU / 0-1), k_sys, star_radius, cloud_rgb, "
           "star_rgb (3-tuples), optional g, floor, scatter, far_gu. Builds "
-          "and uploads the far-field table (CPU, ~1-2 s). Drawn only under "
-          "--developer with Volumetric Nebulae on.");
+          "(CPU, seconds; cached per session, see system_nebula_prebuild) "
+          "and uploads the far-field table. Drawn "
+          "whenever Volumetric Nebulae is on.");
+    m.def("system_nebula_prebuild",
+          [](py::dict d) {
+              const auto [p, look] = parse_system_nebula_profile(d);
+              // Validated even with the host down; the cache lives in the pass.
+              if (!g_system_nebula_pass) return;
+              g_system_nebula_pass->prebuild(p, look);
+          },
+          py::arg("profile"),
+          "Start building the system nebula far-field table for `profile` "
+          "(same keys as set_system_nebula_profile) on a worker thread and "
+          "return at once; a later set_system_nebula_profile with the same "
+          "dict then costs only the upload. No-op if already built/building.");
+    m.def("system_nebula_prebuilt",
+          [](py::dict d) {
+              const auto [p, look] = parse_system_nebula_profile(d);
+              if (!g_system_nebula_pass) return false;
+              return g_system_nebula_pass->prebuilt(p, look);
+          },
+          py::arg("profile"),
+          "True once `profile`'s far-field table is built (by a prebuild or "
+          "an earlier set_system_nebula_profile). Never blocks. False with "
+          "the host down.");
     m.def("set_system_nebula_star",
           [](py::object pos) {
               if (!g_system_nebula_pass) return;
@@ -5050,8 +5310,10 @@ PYBIND11_MODULE(_dauntless_host, m) {
           "Set the system-scale nebula's live look dials: optional keys "
           "lane_size, lane_contrast, g, floor, near_range -- any "
           "key omitted resets that dial to the struct default. A change to "
-          "g or floor rebuilds the far-field table (~1-2s) when a profile is "
-          "already uploaded; lane_size/lane_contrast/near_range never "
+          "g or floor rebuilds the far-field table when a profile is "
+          "already uploaded (measured ~7 s for Vesuvi, 15 rows, on the Debug "
+          "build; ~0.2 s for 3-row systems; cached per session and prebuilt "
+          "during the warp tunnel); lane_size/lane_contrast/near_range never "
           "rebuild. Developer-only tuning: engine/dev_nebula_dials.py.");
     m.def("system_nebula_dials",
           []() -> py::dict {
@@ -5327,6 +5589,23 @@ PYBIND11_MODULE(_dauntless_host, m) {
           "{'speck_cells'} now, {'band_specks', 'puffs'} submitted, and "
           "{'impostors', 'specks' (far + minor), "
           "'draw_calls'} summed over the cameras the last frame drew.");
+    m.def("far_prefetch_atlases",
+          []() {
+              if (g_far_pass) g_far_pass->prefetch_atlases();
+          },
+          "Queue every impostor atlas the far pass has not loaded, failed "
+          "or queued for decoding on worker threads (at most "
+          "kMaxAtlasDecodesInFlight, which take queued atlases themselves "
+          "until none is left). No GL work; a no-op with no far pass.");
+    m.def("far_pump_atlas_uploads",
+          [](int max_uploads) {
+              return g_far_pass ? g_far_pass->pump_atlas_uploads(max_uploads) : 0;
+          },
+          py::arg("max_uploads"),
+          "Upload at most `max_uploads` prefetched atlases whose decode has "
+          "finished (never waits) and return how many are still pending "
+          "(queued, decoding, or decoded and not uploaded); 0 with no far "
+          "pass.");
     m.def("far_clear",
           []() {
               far_zero_fades(g_far_flagged_keys);
@@ -5548,10 +5827,16 @@ PYBIND11_MODULE(_dauntless_host, m) {
                   g.intensity = d["intensity"].cast<float>();
                   auto c = d["color"].cast<std::tuple<float,float,float>>();
                   g.color = glm::vec3(std::get<0>(c), std::get<1>(c), std::get<2>(c));
+                  // Optional: the light's body distance (the star). Absent =
+                  // a lightning flash, whose shafts only the sky casts.
+                  if (d.contains("distance"))
+                      g.distance = d["distance"].cast<float>();
                   g_nebula_godrays.push_back(g);
               }
           },
-          py::arg("flashes"), "Set active lightning flashes for the god-ray pass.");
+          py::arg("flashes"),
+          "Set the god-ray lights: lightning flashes and the star (with its "
+          "render-space \"distance\").");
 
     m.def("set_lens_flares",
           [](const std::vector<py::dict>& descs) {
@@ -5724,6 +6009,10 @@ PYBIND11_MODULE(_dauntless_host, m) {
                   s.max_radius = d["max_radius"].cast<float>();
                   s.age        = d["age"].cast<float>();
                   s.lifetime   = d["lifetime"].cast<float>();
+                  if (d.contains("tint")) {
+                      auto t = d["tint"].cast<std::tuple<float, float, float>>();
+                      s.tint = {std::get<0>(t), std::get<1>(t), std::get<2>(t)};
+                  }
                   g_shockwaves.push_back(std::move(s));
               }
           },
@@ -5835,6 +6124,15 @@ PYBIND11_MODULE(_dauntless_host, m) {
                   e.atlas_cols  = d.contains("atlas_cols")  ? d["atlas_cols"].cast<int>()    : 1;
                   e.atlas_rows  = d.contains("atlas_rows")  ? d["atlas_rows"].cast<int>()    : 1;
                   e.seed        = d.contains("seed")        ? d["seed"].cast<float>()        : 0.0f;
+                  // Sprite library (spec 2026-10-16 §7.4); defaults = today.
+                  e.playback  = d.contains("playback")  ? d["playback"].cast<int>()    : 0;
+                  e.fps       = d.contains("fps")       ? d["fps"].cast<float>()       : 0.0f;
+                  e.orient    = d.contains("orient")    ? d["orient"].cast<int>()      : 0;
+                  e.roll_rate = d.contains("roll_rate") ? d["roll_rate"].cast<float>() : 0.0f;
+                  if (d.contains("pivot")) {
+                      auto p = d["pivot"].cast<std::tuple<float, float>>();
+                      e.pivot = glm::vec2(std::get<0>(p), std::get<1>(p));
+                  }
                   g_particle_emitters.push_back(std::move(e));
               }
           },
@@ -6048,6 +6346,40 @@ PYBIND11_MODULE(_dauntless_host, m) {
     m.def("clear_hologram_ship",
           []() { g_hologram_ship = renderer::HologramShip{}; },
           "Clear the hologram overlay (deactivates it). Takes effect next frame().");
+    m.def("set_running_lights",
+          [](scenegraph::InstanceId id,
+             const std::vector<std::array<float, 9>>& lights, float phase) {
+              std::vector<renderer::RunningLight> out;
+              out.reserve(lights.size());
+              for (const auto& a : lights) {
+                  renderer::RunningLight l;
+                  l.body_pos = {a[0], a[1], a[2]};
+                  l.rgb      = {a[3], a[4], a[5]};
+                  l.size = a[6]; l.period = a[7]; l.duration = a[8];
+                  out.push_back(l);
+              }
+              g_running_lights.set(id, std::move(out), phase);
+          },
+          py::arg("instance_id"), py::arg("lights"), py::arg("phase"),
+          "Set a ship's running lights: each (px,py,pz, r,g,b, size, period, "
+          "duration), body frame, unscaled GU. An empty list removes the ship.");
+    m.def("set_running_light_levels",
+          [](const std::vector<std::pair<scenegraph::InstanceId, float>>& levels) {
+              g_running_lights.set_levels(levels);
+          },
+          py::arg("levels"),
+          "Per-frame brightness (instance_id, level in [0,1]). Ships not listed "
+          "draw dark this frame.");
+    m.def("set_running_light_dials",
+          [](float size_gu_per_radius, float min_px, float intensity) {
+              g_running_light_dials = {size_gu_per_radius, min_px, intensity};
+          },
+          py::arg("size_gu_per_radius"), py::arg("min_px"), py::arg("intensity"));
+    m.def("running_lights_set_enabled",
+          [](bool v) { g_running_lights_enabled = v; }, py::arg("enabled"));
+    m.def("running_lights_enabled", []() { return g_running_lights_enabled; });
+    m.def("running_light_count",
+          []() { return static_cast<int>(g_running_lights.size()); });
     m.def("set_cloak_ships",
           [](const std::vector<std::pair<scenegraph::InstanceId, float>>& ships) {
               g_cloak_ships.clear();
@@ -6608,6 +6940,27 @@ PYBIND11_MODULE(_dauntless_host, m) {
     m.def("profiler_enabled",
           []() { return renderer::frame_timer().enabled(); },
           "True when per-pass frame timing is recording.");
+    m.def("profiler_set_gpu_enabled",
+          [](bool enabled) {
+              renderer::frame_timer().set_gpu_requested(enabled);
+          },
+          py::arg("enabled"),
+          "Opt in to GPU timer queries. Off by default: on Apple's GL they "
+          "make the CPU wait for the GPU, adding about the GPU frame time, "
+          "so a GPU-timed capture is not a frame-time measurement "
+          "(docs/engine/perf-register.md, M-6).");
+    m.def("profiler_gpu_enabled",
+          []() { return renderer::frame_timer().gpu_requested(); },
+          "True when GPU timing has been requested.");
+    m.def("profiler_set_gpu_focus",
+          [](std::vector<std::string> names) {
+              renderer::frame_timer().set_gpu_focus(std::move(names));
+          },
+          py::arg("names"),
+          "Nested scopes to GPU-time under GL_TIME_ELAPSED, which otherwise "
+          "times only the top-level passes (perf-register.md M-1). The "
+          "enclosing top-level pass's query is split around each one, so its "
+          "own total is unchanged. Empty = top-level only (the default).");
     m.def("profiler_reset",
           []() { renderer::frame_timer().reset(); },
           "Drop all accumulated averages and the scope table.");
@@ -6649,6 +7002,26 @@ PYBIND11_MODULE(_dauntless_host, m) {
               return out;
           },
           "Per-pass render timings from the last resolved frame.");
+    m.def("profiler_last_frame_raw",
+          []() {
+              // RAW CPU ms of the frame just closed -- not smoothed, not
+              // lagged. The spike log reads one long frame's own numbers.
+              py::list scopes;
+              const auto& t = renderer::frame_timer();
+              for (const auto& r : t.last_frame_raw()) {
+                  py::dict d;
+                  d["name"]   = r.name;
+                  d["cpu_ms"] = r.cpu_ms;
+                  d["calls"]  = r.calls;
+                  d["depth"]  = r.depth;
+                  scopes.append(std::move(d));
+              }
+              py::dict out;
+              out["cpu_ms"] = t.last_frame_raw_cpu_ms();
+              out["scopes"] = scopes;
+              return out;
+          },
+          "The last frame's raw (un-smoothed) render CPU times, no GPU.");
     m.def("profiler_frame",
           []() {
               py::dict d;
@@ -6664,6 +7037,12 @@ PYBIND11_MODULE(_dauntless_host, m) {
                              : timer == GpuTimer::Elapsed   ? "elapsed"
                                                             : "none";
               d["gpu_queries"] = t.gpu_queries_active();
+              // False = CPU-only by choice (the default), not a dead driver.
+              d["gpu_requested"] = t.gpu_requested();
+              // Nested scopes timed by splitting their top-level pass's query.
+              py::list focus;
+              for (const auto& f : t.gpu_focus()) focus.append(f);
+              d["gpu_focus"] = focus;
               // What the driver declared (GL_QUERY_COUNTER_BITS), -1 until the
               // first enabled frame has read it.
               d["timestamp_bits"] = t.timestamp_bits();
@@ -7153,7 +7532,7 @@ PYBIND11_MODULE(_dauntless_host, m) {
              std::tuple<float, float, float> world_point,
              std::tuple<float, float, float> world_normal,
              float influ_radius, float strength, float /*time*/,
-             float floor_radius, float radius_modifier) {
+             float floor_radius, float radius_modifier, bool carve_field) {
               auto* inst = g_world.get(id);
               if (inst == nullptr) return;  // stale id — drop silently
               const glm::vec3 pw(std::get<0>(world_point),
@@ -7255,7 +7634,8 @@ PYBIND11_MODULE(_dauntless_host, m) {
                   renderer::hull_carve_deposit(
                       inst->carve, g_instance_field_cache.get(), id, source,
                       authored_res, pb, nb, influ_model, strength,
-                      floor_model, radius_modifier, inv_s, fill_for_gate);
+                      floor_model, radius_modifier, inv_s, fill_for_gate,
+                      carve_field);
 
               // Breach event (transient VFX: debris, venting, rim) only when the
               // carve newly appears or visibly grows — sub-iso accumulation is
@@ -7281,6 +7661,7 @@ PYBIND11_MODULE(_dauntless_host, m) {
           py::arg("instance_id"), py::arg("world_point"), py::arg("world_normal"),
           py::arg("influ_radius"), py::arg("strength"), py::arg("time"),
           py::arg("floor_radius") = 0.0f, py::arg("radius_modifier") = 1.0f,
+          py::arg("carve_field") = true,
           "Deposit hull-damage strength onto a ship instance (BC additive "
           "metaball field). World-space point + normal are transformed to body "
           "frame (model units). influ_radius is the merge proximity; strength "
@@ -7291,7 +7672,9 @@ PYBIND11_MODULE(_dauntless_host, m) {
           "floor_radius guarantees a size for authored / core-breach carves "
           "(combat hits pass floor 0 and stay invisible until accumulated "
           "strength crosses the iso). time is accepted for call-shape symmetry "
-          "with damage_decal_add but unused.");
+          "with damage_decal_add but unused. carve_field=False grows the "
+          "sphere ring only and leaves the per-instance field for a later "
+          "deposit (a growing carve carves the field once, at full size).");
 
     m.def("hull_split_detached",
           [](scenegraph::InstanceId id, int min_cells) {
@@ -7449,7 +7832,12 @@ PYBIND11_MODULE(_dauntless_host, m) {
     // comment in carve_field_cache.h.
     m.def("hull_volume_set_cache_root",
           [](const std::string& root) {
-              renderer::set_hull_volume_cache_root(root);
+              // pybind11 hands the Python str over as UTF-8. path(std::string)
+              // would decode it in the ANSI codepage on Windows and mangle a
+              // non-ASCII user name. (u8path is deprecated in C++20.)
+              renderer::set_hull_volume_cache_root(std::filesystem::path(
+                  std::u8string(reinterpret_cast<const char8_t*>(root.data()),
+                                root.size())));
           },
           py::arg("root"),
           "Directory HullVolumeCache reads/writes its on-disk .dhv bakes "
@@ -7539,12 +7927,33 @@ PYBIND11_MODULE(_dauntless_host, m) {
               if (!(authored_res > 0.0f)) return;
               renderer::hull_volume_cache().get(model->source, authored_res,
                                                 voxel::kDefaultQuality);
+              renderer::prewarm_trace_accel(*model);
           },
           pybind11::arg("instance_id"),
           "Force this instance's hull damage field to bake now (or load its "
-          "on-disk .dhv cache), instead of lazily on its first "
-          "hull_carve_add deposit during combat. No-op when no authored "
-          "resolution has been pushed for this hull yet.");
+          "on-disk .dhv cache), and its model's ray-trace BVH to build, "
+          "instead of lazily on the first hull_carve_add deposit / first "
+          "trace during combat. No-op when no authored resolution has been "
+          "pushed for this hull yet.");
+
+    // Same as hull_volume_set_resolution + hull_volume_prewarm, but from a
+    // MODEL handle: the warp-tunnel preload warms hulls before any ship is
+    // realised, so there is no instance to resolve through. Creates none.
+    m.def("hull_volume_prewarm_model",
+          [](scenegraph::ModelHandle model_handle, float resolution) {
+              if (!(resolution > 0.0f)) return;
+              const assets::Model* model = resolve_model(model_handle);
+              if (model == nullptr || model->source.empty()) return;
+              renderer::set_hull_volume_resolution(model->source, resolution);
+              renderer::hull_volume_cache().get(model->source, resolution,
+                                                voxel::kDefaultQuality);
+              renderer::prewarm_trace_accel(*model);
+          },
+          pybind11::arg("model"), pybind11::arg("resolution"),
+          "Set the authored resolution for this model's hull and bake (or "
+          "load the on-disk .dhv of) its damage volume now, and build its "
+          "ray-trace BVH, without creating an instance. No-op for an unknown "
+          "handle or resolution <= 0.");
 
     m.def("compute_capsule_region",
           [](scenegraph::InstanceId id,
@@ -8094,6 +8503,12 @@ PYBIND11_MODULE(_dauntless_host, m) {
           py::arg("x"), py::arg("y"));
 
     // Test/debug helper: return the current framebuffer size.
+    m.def("request_frame_png",
+          [](const std::string& path) { g_frame_png_path = path; },
+          py::arg("path"),
+          "Write the next finished frame (default framebuffer, overlay "
+          "included) to `path` as a PNG, once. Developer diagnostics: the "
+          "unattended runs' before/after screenshots (dev_scripted_run).");
     m.def("framebuffer_size",
           []() {
               if (!g_window) {

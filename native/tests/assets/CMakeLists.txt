@@ -23,12 +23,14 @@ add_executable(assets_tests
     cpu/raw_image_decode_test.cc
     cpu/skeleton_build_test.cc
     cpu/skin_weights_test.cc
+    cpu/skin_offsets_test.cc
     cpu/tessellate_test.cc
     cpu/geosphere_test.cc
     cpu/geosphere_apply_test.cc
     cpu/rigid_bake_test.cc
     cpu/texture_decode_test.cc
     cpu/flip_frame_test.cc
+    cpu/file_bytes_test.cc
     cpu/normal_gen_test.cc
     gpu/gl_fixture.cc
     gpu/fixture_smoke_test.cc

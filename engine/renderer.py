@@ -31,6 +31,8 @@ InstanceId = _h.InstanceId
 #   hard-fails `import`, so it needs no manifest entry.
 _REQUIRED_BINDINGS = frozenset({
     "add_box_region", "add_cylinder_region", "add_sphere_region",
+    "running_light_count", "running_lights_enabled", "running_lights_set_enabled",
+    "set_running_light_dials", "set_running_light_levels", "set_running_lights",
     "ambient_gradient_get", "ambient_gradient_set", "ambient_gradient_set_enabled",
     "assemble_officer", "bridge_pass_set_enabled", "bridge_quality",
     "cef_composite", "cef_devtools_open", "cef_initialize", "cef_pump",
@@ -46,6 +48,7 @@ _REQUIRED_BINDINGS = frozenset({
     "get_instance_head_center", "hdr_lens_flare_enabled",
     "hdr_lens_flare_set_enabled", "hdr_set_enabled",
     "hull_volume_bake_to_disk", "hull_volume_prewarm",
+    "hull_volume_prewarm_model",
     "hull_volume_set_cache_root", "hull_volume_set_resolution",
     "hull_source_string",
     "init", "letterbox_set",
@@ -71,7 +74,7 @@ _REQUIRED_BINDINGS = frozenset({
     "set_dust_planets", "set_dust_profile", "set_emissive_scale", "set_game_root", "set_glow_region_dim",
     "set_instance_atmosphere",
     "set_instance_surface",
-    "set_project_asset_root",
+    "set_project_asset_root", "prewarm_scuff_normal_texture",
     "set_glow_region_gain",
     "set_hologram_only_mode", "set_hologram_ship", "set_hull_discharges",
     "set_instance_decals",
@@ -82,6 +85,7 @@ _REQUIRED_BINDINGS = frozenset({
     "set_subsystem_pins", "set_suns",
     "set_system_nebula_profile", "set_system_nebula_star",
     "set_system_nebula_flashes",
+    "system_nebula_prebuild", "system_nebula_prebuilt",
     "system_nebula_set_dials", "system_nebula_dials",
     "minors_add_cloud", "minors_remove_cloud", "minors_detach",
     "minors_fade_out", "minors_set_fragments", "minors_set_player",
@@ -89,7 +93,7 @@ _REQUIRED_BINDINGS = frozenset({
     "minors_drain_contacts", "minors_stats", "minors_clear",
     "far_set_catalogue", "far_set_rocks", "far_set_sources",
     "far_set_frame", "far_set_dials", "far_set_enabled", "far_enabled",
-    "far_stats", "far_clear",
+    "far_stats", "far_clear", "far_prefetch_atlases", "far_pump_atlas_uploads",
     "rock_specks_set_enabled", "rock_specks_enabled",
     "rock_puffs_set_enabled", "rock_puffs_enabled",
     "rockfield_drain_contacts", "rockfield_set_shield_inflate",
@@ -112,6 +116,7 @@ _REQUIRED_BINDINGS = frozenset({
 # never fatal. `set_officer_face` also appears as a hard `_h.set_officer_face`
 # call *inside* its own hasattr guard, so it is optional despite that inner ref.
 _OPTIONAL_BINDINGS = frozenset({
+    "request_frame_png",
     "cef_execute_javascript", "clear_debug_boxes", "clear_debug_cones",
     "clear_debug_cylinders",
     "clear_debug_spheres",
@@ -274,6 +279,12 @@ def set_project_asset_root(root: str) -> None:
     the checkout. Pushed once at boot beside set_game_root; no hasattr guard
     (see hull_volume_set_cache_root)."""
     _h.set_project_asset_root(str(root))
+
+
+def prewarm_scuff_normal_texture() -> None:
+    """Load the collision-scuff normal map at boot instead of on the first
+    scuff drawn (perf-register P-11). After set_project_asset_root."""
+    _h.prewarm_scuff_normal_texture()
 
 
 def set_asset_overrides(overrides: dict) -> None:
@@ -537,10 +548,27 @@ def set_system_nebula_profile(profile: dict | None) -> None:
     """Set (dict) or clear (None) the system-scale nebula profile: keys r,
     nebula (lists, GU / 0-1), k_sys, star_radius, cloud_rgb, star_rgb
     (3-tuples), optional g, floor, scatter, far_gu. Builds and uploads the
-    far-field table (CPU, ~1-2s) -- push once per system, never per frame.
-    Drawn only under --developer with Volumetric Nebulae on
+    far-field table (CPU, seconds; cached per session -- system_nebula_prebuild
+    builds it ahead on a worker) -- push once per system, never per frame.
+    Drawn whenever Volumetric Nebulae is on
     (docs/superpowers/specs/2026-09-29-system-nebula-render-design.md)."""
     _h.set_system_nebula_profile(profile)
+
+
+def system_nebula_prebuild(profile: dict) -> None:
+    """Start building `profile`'s far-field table (same keys as
+    set_system_nebula_profile) on a worker thread and return at once, so a
+    later set_system_nebula_profile(profile) costs only the texture upload.
+    Built tables are cached for the session; a no-op if already built or
+    building."""
+    _h.system_nebula_prebuild(profile)
+
+
+def system_nebula_prebuilt(profile: dict) -> bool:
+    """True once `profile`'s far-field table is built -- by a prebuild or an
+    earlier set_system_nebula_profile. Never blocks; False with the host
+    down."""
+    return bool(_h.system_nebula_prebuilt(profile))
 
 
 def set_system_nebula_star(pos: tuple | None) -> None:
@@ -563,7 +591,9 @@ def system_nebula_set_dials(dials: dict) -> None:
     engine/dev_nebula_dials.py): optional keys lane_size, lane_contrast, g,
     floor, near_range; any key omitted resets that dial to
     the native struct default. A g or floor change rebuilds the far-field
-    table (~1-2s) when a profile is already uploaded."""
+    table when a profile is already uploaded (measured ~7 s for Vesuvi
+    (15 rows) on the Debug build, ~0.2 s for 3-row systems; cached per
+    session and prebuilt during the warp tunnel)."""
     _h.system_nebula_set_dials(dials)
 
 
@@ -716,6 +746,21 @@ def far_clear() -> None:
     _h.far_clear()
 
 
+def far_prefetch_atlases() -> None:
+    """Queue every impostor atlas not yet loaded for decoding on worker
+    threads (mission load in far_tier, and the warp-tunnel preload): at most
+    kMaxAtlasDecodesInFlight workers, which take queued atlases themselves
+    until none is left. No GL work; a no-op before the far pass exists."""
+    _h.far_prefetch_atlases()
+
+
+def far_pump_atlas_uploads(max_uploads: int) -> int:
+    """Upload at most `max_uploads` prefetched atlases whose decode finished
+    (never waits on one) and return how many are still pending (queued,
+    decoding, or decoded and not uploaded)."""
+    return _h.far_pump_atlas_uploads(int(max_uploads))
+
+
 def rockfield_drain_contacts() -> list:
     """Player/large near-rock touches since the last drain: [{"point",
     "normal", "rock_centre" (VIEW-space tuples), "rock_radius", "rel_speed",
@@ -770,8 +815,10 @@ def set_nebula_wake(points: list) -> None:
 
 
 def set_nebula_godrays(flashes: list) -> None:
-    """Active lightning flashes for the god-ray pass. Each: {"dir": (x,y,z),
-    "intensity": float, "color": (r,g,b)}. Empty list = no god-rays."""
+    """God-ray lights: lightning flashes and the star. Each: {"dir": (x,y,z),
+    "intensity": float, "color": (r,g,b)}, plus "distance" (render-space GU)
+    for a light with a body on screen -- the star; hulls nearer than it
+    occlude its shafts. Empty list = no god-rays."""
     _h.set_nebula_godrays(flashes)
 
 
@@ -885,6 +932,16 @@ def hull_volume_prewarm(iid: InstanceId) -> None:
     _h.hull_volume_prewarm(iid)
 
 
+def hull_volume_prewarm_model(model: int, resolution: float) -> None:
+    """Bake/load a hull's damage volume from its MODEL handle, creating no
+    instance. Sets the authored resolution for the model's source, then warms
+    the cache. No-op for an unknown handle or non-positive resolution.
+
+    No hasattr guard, deliberately (see hull_volume_prewarm).
+    """
+    _h.hull_volume_prewarm_model(model, float(resolution))
+
+
 def hull_volume_bake_to_disk(hull_path: str, authored_res: float) -> bool:
     """Bake (or validate) one hull's on-disk `.dhv` at BC's authored
     SetDamageResolution, WITHOUT touching the in-memory cache.
@@ -934,6 +991,14 @@ def nonfinite_probe_stats() -> dict:
     grid_h, last_cells (list of (x, y), bottom-left origin).
     """
     return dict(_h.nonfinite_probe_stats())
+
+
+def request_frame_png(path: str) -> None:
+    """Write the next finished frame to `path` as a PNG, once (developer
+    diagnostics; engine/dev_scripted_run.py's DAUNTLESS_DEV_SCREENSHOT)."""
+    fn = getattr(_h, "request_frame_png", None)
+    if fn is not None:
+        fn(str(path))
 
 
 def set_shadows_enabled(enabled: bool) -> None:
@@ -1531,6 +1596,39 @@ def set_hologram_ship(instance_id: InstanceId,
 def clear_hologram_ship() -> None:
     """Deactivate the hologram overlay. Takes effect next frame()."""
     _h.clear_hologram_ship()
+
+
+# ── Running lights (docs/superpowers/specs/2026-10-14-ship-running-lights-design.md) ──
+
+def set_running_lights(iid, lights, phase: float) -> None:
+    """A ship's running lights, sent once at spawn (running-lights spec §4.3).
+    `lights` is a list of 9-tuples (px,py,pz, r,g,b, size, period, duration),
+    body frame, unscaled GU. An empty list removes the ship."""
+    _h.set_running_lights(iid, [tuple(float(v) for v in l) for l in lights],
+                          float(phase))
+
+
+def set_running_light_levels(levels) -> None:
+    """Per-frame (instance_id, level) brightness; unlisted ships draw dark."""
+    _h.set_running_light_levels([(iid, float(lv)) for iid, lv in levels])
+
+
+def set_running_light_dials(size_gu_per_radius: float, min_px: float,
+                            intensity: float) -> None:
+    _h.set_running_light_dials(float(size_gu_per_radius), float(min_px),
+                               float(intensity))
+
+
+def running_lights_set_enabled(enabled: bool) -> None:
+    _h.running_lights_set_enabled(bool(enabled))
+
+
+def running_lights_enabled() -> bool:
+    return bool(_h.running_lights_enabled())
+
+
+def running_light_count() -> int:
+    return int(_h.running_light_count())
 
 
 # ── Cloak refraction ─────────────────────────────────────────────────────────

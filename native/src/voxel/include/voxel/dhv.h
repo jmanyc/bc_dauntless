@@ -12,7 +12,7 @@ namespace voxel {
 /// Bump whenever bake OUTPUT changes for the same inputs. Every cached file
 /// carries it, and read_dhv rejects any mismatch, so a baker change
 /// invalidates the whole cache without anyone having to remember to clear it.
-inline constexpr std::uint16_t kBakerVersion = 1;
+inline constexpr std::uint16_t kBakerVersion = 2;  // 2: kMaxFieldCells 2^24 -> 2^22
 
 /// Provenance stored alongside the field, so a cache entry can be validated
 /// against the hull it claims to describe.
@@ -47,10 +47,12 @@ struct HullVolumeMeta {
 
 /// Write `field` + `meta` to `path`, creating parent directories. Writes to a
 /// sibling temporary and renames, so a crash mid-write cannot leave a
-/// half-written file where a valid one is expected. False on any I/O failure.
+/// half-written file where a valid one is expected. False on any I/O failure;
+/// then, when `why` is given, it receives a one-line reason.
 bool write_dhv(const std::filesystem::path& path,
                const DistanceField& field,
-               const HullVolumeMeta& meta);
+               const HullVolumeMeta& meta,
+               std::string* why = nullptr);
 
 /// Read `path`. Returns false -- and leaves the outputs untouched -- for a
 /// missing file, a bad magic, a format or baker version mismatch, an

@@ -3,6 +3,7 @@
 
 #include "renderer/nebula_atmosphere.h"
 #include "renderer/nebula_godray_pass.h"   // GodrayFlash
+#include "renderer/system_nebula_cache.h"
 
 #include <glm/glm.hpp>
 
@@ -19,15 +20,15 @@ struct Lighting;
 
 /// System-scale nebula: the whole star system as a star-centred atmosphere
 /// (docs/superpowers/specs/2026-09-29-system-nebula-render-design.md).
-/// DEVELOPER-ONLY for now -- host frame() gates it on --developer AND the
-/// volumetric-nebula setting; without both, NebulaVolumetricPass / NebulaPass
-/// render exactly as before.
+/// On in production (2026-10-16): host frame() gates it on the
+/// volumetric-nebula setting alone; with it off, NebulaVolumetricPass /
+/// NebulaPass render exactly as before.
 ///
-/// Started as a copy of NebulaVolumetricPass and keeps its performance
-/// machinery unchanged: quarter-resolution ping-pong target, dither step
-/// offset, conservative temporal reprojection (reset on large eye deltas and
-/// origin discontinuities) and the depth-aware upsample composited
-/// premultiplied OVER the HDR target.
+/// Started as a copy of NebulaVolumetricPass and keeps its quarter-resolution
+/// target, dither step offset and depth-aware upsample composited
+/// premultiplied OVER the HDR target. Its temporal reprojection was REMOVED
+/// (2026-10-19): it smeared the haze on every camera sweep, and without it
+/// the haze showed no shimmer (Mark, live). Each frame is its own march.
 ///
 /// What it marches (system_nebula.frag): a near field of ~64 geometric steps
 /// out to dials().near_range through the radial density texture (density,
@@ -68,9 +69,8 @@ struct NebulaDrawPlan {
 };
 
 /// frame()'s nebula decision, pure so it is testable without a host.
-NebulaDrawPlan plan_nebula_draws(bool volumetric_setting, bool developer,
-                                 bool has_profile, bool have_volumes,
-                                 bool have_wake);
+NebulaDrawPlan plan_nebula_draws(bool volumetric_setting, bool has_profile,
+                                 bool have_volumes, bool have_wake);
 
 class SystemNebulaPass {
 public:
@@ -81,9 +81,11 @@ public:
     SystemNebulaPass(const SystemNebulaPass&) = delete;
     SystemNebulaPass& operator=(const SystemNebulaPass&) = delete;
 
-    /// Build the radial texels and far-field table on the CPU and upload
-    /// them: radial -> GL_RG32F kRadialTexels x 1; table -> two GL_RGB32F
-    /// kTableR x kTableMu (optical depth, inscatter). Needs a current context.
+    /// Upload the radial texels and far-field table: radial -> GL_RG32F
+    /// kRadialTexels x 1; table -> two GL_RGB32F kTableR x kTableMu (optical
+    /// depth, inscatter). The CPU build comes from the session TableCache: a
+    /// hit or finished prebuild() costs only the upload; a miss builds
+    /// synchronously (seconds). Needs a current context.
     void set_profile(const atmosphere::RadialProfile& profile,
                      const atmosphere::LookParams& look);
     /// Delete the profile textures and forget the profile and the star; the
@@ -91,9 +93,20 @@ public:
     void clear_profile();
     bool has_profile() const { return has_profile_; }
 
+    /// Start building (profile, look)'s table on a worker thread so a later
+    /// set_profile with the same inputs costs only the upload. No GL; a
+    /// no-op when already built or building.
+    void prebuild(const atmosphere::RadialProfile& profile,
+                  const atmosphere::LookParams& look) { cache_.prebuild(profile, look); }
+    /// True once (profile, look)'s table is built (never blocks).
+    bool prebuilt(const atmosphere::RadialProfile& profile,
+                  const atmosphere::LookParams& look) { return cache_.ready(profile, look); }
+
     /// Set the near-field/table look dials. A change to `g` or `floor` with
     /// a profile already uploaded rebuilds the far-field table (re-runs
-    /// set_profile with the updated LookParams, ~1-2s); `lane_size`,
+    /// set_profile with the updated LookParams; measured ~7 s for Vesuvi
+    /// (15 rows) on the Debug build, ~0.2 s for 3-row systems; cached per
+    /// session and prebuilt during the warp tunnel); `lane_size`,
     /// `lane_contrast` and `near_range` are read directly by the shader
     /// every frame and never trigger a rebuild.
     void set_dials(const Dials& dials);
@@ -136,18 +149,9 @@ public:
                 float time,
                 const glm::dvec3& render_origin = glm::dvec3(0.0));
 
-    /// Drop the temporal history (and the origin it was in): the next frame
-    /// marches fresh instead of reprojecting across an origin discontinuity.
-    void reset_history() {
-        have_history_ = false;
-        prev_origin_ = glm::dvec3(0.0);
-    }
-    bool has_history() const { return have_history_; }
-
 private:
     void initialize_gl();
-    /// (Re)allocate the low-res ping-pong targets to (w, h). No-op if already
-    /// that size. Invalidates temporal history on a resize.
+    /// (Re)allocate the low-res target to (w, h). No-op if already that size.
     void ensure_half_targets(int w, int h);
     void destroy_half_targets();
     void destroy_profile_textures();
@@ -155,18 +159,11 @@ private:
     bool         initialized_ = false;
     unsigned int vao_ = 0;   // empty VAO; fullscreen triangle uses gl_VertexID
 
-    // ── Low-res ping-pong scratch targets (RGBA16F) ────────────────────────
+    // ── Low-res scratch target (RGBA16F) ───────────────────────────────────
     int          half_w_ = 0;
     int          half_h_ = 0;
-    unsigned int half_fbo_[2] = {0, 0};
-    unsigned int half_tex_[2] = {0, 0};
-    int          cur_ = 0;            // index written this frame
-
-    // ── Temporal reprojection state ────────────────────────────────────────
-    bool         have_history_ = false;
-    glm::mat4    prev_view_proj_ = glm::mat4(1.0f);
-    glm::vec3    prev_eye_ = glm::vec3(0.0f);
-    glm::dvec3   prev_origin_ = glm::dvec3(0.0);
+    unsigned int half_fbo_ = 0;
+    unsigned int half_tex_ = 0;
 
     // ── Profile ────────────────────────────────────────────────────────────
     unsigned int radial_tex_ = 0;     // RG32F: density, tau_star by u = sqrt(r/far)
@@ -180,6 +177,7 @@ private:
     std::vector<GodrayFlash> flashes_;
     Dials        dials_;
     int          profile_rebuild_count_ = 0;
+    atmosphere::TableCache cache_;   // built tables, per session (never evicted)
 };
 
 }  // namespace renderer

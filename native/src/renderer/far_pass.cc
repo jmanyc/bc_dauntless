@@ -3,12 +3,13 @@
 #include "renderer/far_pass.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
-#include <fstream>
-#include <iterator>
+#include <exception>
 #include <stdexcept>
 #include <string>
+#include <system_error>
 #include <vector>
 
 #include <glad/glad.h>
@@ -17,8 +18,11 @@
 
 #include <scenegraph/camera.h>
 
+#include <assets/file_bytes.h>
+
 #include "renderer/asset_path.h"
 #include "renderer/frame.h"
+#include "renderer/frame_timer.h"
 #include "renderer/pipeline.h"
 #include "renderer/rock_shading.h"
 #include "renderer/shader.h"
@@ -56,8 +60,8 @@ GLuint make_1x1(const std::uint8_t rgba[4]) {
     return t;
 }
 
-assets::Texture upload_atlas(assets::Image img) {
-    dilate_coverage(img, kDilatePasses);
+// Upload an atlas image that is ALREADY dilated (GL; main thread only).
+assets::Texture upload_dilated(const assets::Image& img) {
     assets::Texture t = assets::upload_image(img, /*generate_mipmaps=*/true);
     // Cells tile the atlas: never wrap one edge's texels onto the other.
     glBindTexture(GL_TEXTURE_2D, t.id());
@@ -67,13 +71,26 @@ assets::Texture upload_atlas(assets::Image img) {
     return t;
 }
 
-assets::Image read_image(const std::string& path) {
-    const std::string resolved = is_absolute_asset_path(path) ? path : project_asset_path(path);
-    std::ifstream in(resolved, std::ios::binary);
-    if (!in) throw std::runtime_error("cannot open " + resolved);
-    std::vector<std::uint8_t> bytes((std::istreambuf_iterator<char>(in)),
-                                    std::istreambuf_iterator<char>());
-    return assets::decode_image(bytes);
+// MAIN THREAD: project_asset_path reads the mutable project asset root, so
+// a path is resolved before any worker sees it.
+std::string resolve_atlas_path(const std::string& path) {
+    return is_absolute_asset_path(path) ? path : project_asset_path(path);
+}
+
+// Any thread: file read + decode + dilate, touching nothing shared but the
+// atomic decode counter.
+assets::Image read_dilated(const std::string& resolved, std::atomic<int>* decodes) {
+    decodes->fetch_add(1);
+    const auto bytes = assets::read_binary_file(resolved);
+    if (!bytes) throw std::runtime_error("cannot open " + resolved);
+    assets::Image img = assets::decode_image(*bytes);
+    dilate_coverage(img, kDilatePasses);
+    return img;
+}
+
+void warn_not_loaded(int index, const char* why) {
+    std::fprintf(stderr, "[far_pass] impostor atlas for catalogue rock %d not loaded: %s\n",
+                 index, why);
 }
 
 }  // namespace
@@ -114,6 +131,7 @@ void dilate_coverage(assets::Image& img, int passes) {
 }
 
 FarPass::~FarPass() {
+    drop_decodes();     // joins the workers before anything they touch goes
     atlases_.clear();
     if (vao_ != 0) { GLuint v = vao_; glDeleteVertexArrays(1, &v); }
     if (corner_vbo_ != 0) { GLuint b = corner_vbo_; glDeleteBuffers(1, &b); }
@@ -124,19 +142,156 @@ FarPass::~FarPass() {
     if (rock_speck_vbo_ != 0) { GLuint b = rock_speck_vbo_; glDeleteBuffers(1, &b); }
     if (rock_puff_vao_ != 0) { GLuint v = rock_puff_vao_; glDeleteVertexArrays(1, &v); }
     if (rock_puff_vbo_ != 0) { GLuint b = rock_puff_vbo_; glDeleteBuffers(1, &b); }
+    if (rock_puff_hash_tex_ != 0) { GLuint t = rock_puff_hash_tex_; glDeleteTextures(1, &t); }
     if (white_texture_ != 0) { GLuint t = white_texture_; glDeleteTextures(1, &t); }
     if (black_texture_ != 0) { GLuint t = black_texture_; glDeleteTextures(1, &t); }
 }
 
 void FarPass::set_atlas_paths(std::vector<std::pair<std::string, std::string>> albedo_normal) {
+    drop_decodes();    // decodes of the OLD paths: never installed
     paths_ = std::move(albedo_normal);
     failed_.clear();   // new paths: a failure is retried, not remembered
 }
 
 void FarPass::install_atlas(int index, assets::Image albedo, assets::Image normal) {
-    AtlasGpu a{upload_atlas(std::move(albedo)), upload_atlas(std::move(normal))};
+    dilate_coverage(albedo, kDilatePasses);
+    dilate_coverage(normal, kDilatePasses);
+    install_dilated(index, AtlasCpu{std::move(albedo), std::move(normal)});
+}
+
+void FarPass::install_dilated(int index, const AtlasCpu& atlas) {
+    AtlasGpu a{upload_dilated(atlas.albedo), upload_dilated(atlas.normal)};
     atlases_.insert_or_assign(index, std::move(a));
     failed_.erase(index);
+}
+
+bool FarPass::finish_pending(int index) {
+    const auto it = pending_.find(index);
+    std::future<AtlasCpu> decoding = std::move(it->second);
+    pending_.erase(it);
+    try {
+        install_dilated(index, decoding.get());   // get() rethrows a worker's exception
+        return true;
+    } catch (const std::exception& e) {
+        failed_.insert(index);
+        warn_not_loaded(index, e.what());
+    } catch (...) {
+        failed_.insert(index);
+        warn_not_loaded(index, "unknown error");
+    }
+    return false;
+}
+
+void FarPass::prefetch_atlases() {
+    {
+        std::lock_guard<std::mutex> lock(queue_->mutex);
+        for (std::size_t i = 0; i < paths_.size(); ++i) {
+            const int index = static_cast<int>(i);
+            if (atlases_.count(index) != 0 || failed_.count(index) != 0 ||
+                pending_.count(index) != 0)
+                continue;
+            // No impostor (empty path): never drawn, so never loaded -- as lazily.
+            if (paths_[i].first.empty() || paths_[i].second.empty()) continue;
+            DecodeJob job{resolve_atlas_path(paths_[i].first),
+                          resolve_atlas_path(paths_[i].second), {}};
+            pending_.emplace(index, job.done.get_future());
+            queue_->jobs.emplace(index, std::move(job));
+        }
+    }
+    start_decode_workers();
+}
+
+void FarPass::decode_worker(std::shared_ptr<DecodeQueue> queue) {
+    for (;;) {
+        DecodeJob job;
+        {
+            std::lock_guard<std::mutex> lock(queue->mutex);
+            if (queue->jobs.empty()) {
+                --queue->workers;   // under the lock: a prefetch now starts a new one
+                return;
+            }
+            const auto it = queue->jobs.begin();
+            job = std::move(it->second);
+            queue->jobs.erase(it);
+        }
+        const int now = queue->running.fetch_add(1) + 1;
+        int seen = queue->max_running.load();
+        while (now > seen && !queue->max_running.compare_exchange_weak(seen, now)) {}
+        try {
+            AtlasCpu a;
+            a.albedo = read_dilated(job.albedo, &queue->decodes);
+            a.normal = read_dilated(job.normal, &queue->decodes);
+            job.done.set_value(std::move(a));
+        } catch (...) {
+            job.done.set_exception(std::current_exception());
+        }
+        queue->running.fetch_sub(1);
+    }
+}
+
+void FarPass::start_decode_workers() {
+    // A worker returns once the queue is empty: forget the finished ones.
+    workers_.erase(std::remove_if(workers_.begin(), workers_.end(),
+                                  [](const std::future<void>& w) {
+                                      return w.wait_for(std::chrono::seconds(0)) ==
+                                             std::future_status::ready;
+                                  }),
+                   workers_.end());
+    if (workers_paused_) return;
+    int wanted = 0;
+    {
+        std::lock_guard<std::mutex> lock(queue_->mutex);
+        if (queue_->jobs.empty()) return;
+        wanted = kMaxAtlasDecodesInFlight - queue_->workers;
+        queue_->workers += wanted;   // counted before they run: each decrements on exit
+    }
+    int started = 0;
+    for (; started < wanted; ++started) {
+        try {
+            workers_.push_back(std::async(std::launch::async, decode_worker, queue_));
+        } catch (const std::system_error&) {
+            break;
+        }
+    }
+    std::lock_guard<std::mutex> lock(queue_->mutex);
+    queue_->workers -= wanted - started;
+    if (queue_->workers > 0) return;
+    // No thread to be had: the queued atlases load lazily, as before.
+    for (const auto& [index, job] : queue_->jobs) pending_.erase(index);
+    queue_->jobs.clear();
+}
+
+void FarPass::drop_decodes() {
+    {
+        std::lock_guard<std::mutex> lock(queue_->mutex);
+        queue_->jobs.clear();   // never started
+    }
+    for (auto& w : workers_) w.wait();   // each finishes the atlas it holds
+    workers_.clear();
+    pending_.clear();
+}
+
+int FarPass::pump_atlas_uploads(int max_uploads) {
+    int uploaded = 0;
+    for (auto it = pending_.begin(); it != pending_.end() && uploaded < max_uploads;) {
+        if (it->second.wait_for(std::chrono::seconds(0)) != std::future_status::ready) {
+            ++it;
+            continue;
+        }
+        const int index = it->first;
+        ++it;   // finish_pending erases `index`'s entry
+        if (finish_pending(index)) ++uploaded;
+    }
+    return static_cast<int>(pending_.size());
+}
+
+void FarPass::debug_pause_decode_workers(bool paused) {
+    workers_paused_ = paused;
+    if (!paused) start_decode_workers();
+}
+
+void FarPass::debug_wait_atlas_decodes() {
+    for (auto& w : workers_) w.wait();
 }
 
 void FarPass::debug_set_atlas(int index, const assets::Image& albedo, const assets::Image& normal) {
@@ -146,6 +301,18 @@ void FarPass::debug_set_atlas(int index, const assets::Image& albedo, const asse
 const FarPass::AtlasGpu* FarPass::atlas_for(int index) {
     if (auto it = atlases_.find(index); it != atlases_.end()) return &it->second;
     if (failed_.count(index) != 0) return nullptr;
+    if (pending_.count(index) != 0) {
+        bool taken = false;   // no worker has it yet: load it here, not behind the queue
+        {
+            std::lock_guard<std::mutex> lock(queue_->mutex);
+            taken = queue_->jobs.erase(index) != 0;
+        }
+        if (!taken) {
+            DAUNTLESS_FRAME_SCOPE("rock.atlas.load");   // the wait + upload left on the frame
+            return finish_pending(index) ? &atlases_.at(index) : nullptr;
+        }
+        pending_.erase(index);   // the lazy load below replaces it
+    }
     if (index < 0 || static_cast<std::size_t>(index) >= paths_.size()) {
         failed_.insert(index);
         std::fprintf(stderr, "[far_pass] no atlas path for catalogue rock %d\n", index);
@@ -153,11 +320,14 @@ const FarPass::AtlasGpu* FarPass::atlas_for(int index) {
     }
     const auto& [albedo_path, normal_path] = paths_[static_cast<std::size_t>(index)];
     try {
-        install_atlas(index, read_image(albedo_path), read_image(normal_path));
+        DAUNTLESS_FRAME_SCOPE("rock.atlas.load");
+        AtlasCpu a;
+        a.albedo = read_dilated(resolve_atlas_path(albedo_path), &queue_->decodes);
+        a.normal = read_dilated(resolve_atlas_path(normal_path), &queue_->decodes);
+        install_dilated(index, a);
     } catch (const std::exception& e) {
         failed_.insert(index);
-        std::fprintf(stderr, "[far_pass] impostor atlas for catalogue rock %d not loaded: %s\n",
-                     index, e.what());
+        warn_not_loaded(index, e.what());
         return nullptr;
     }
     return &atlases_.at(index);
@@ -520,16 +690,62 @@ void FarPass::upload_rock_puffs(const std::vector<rockfield::PuffGpu>& puffs) {
     rock_puff_count_ = static_cast<int>(puffs.size());
 }
 
+void FarPass::bake_rock_puff_hash(Pipeline& pipeline) {
+    // Once per FarPass: the table depends on nothing but the expression.
+    const int n = rockfield::kPuffHashSize;
+    GLint prev_fbo = 0, prev_vp[4] = {0, 0, 0, 0}, prev_tex = 0, prev_unit = 0;
+    glGetIntegerv(GL_FRAMEBUFFER_BINDING, &prev_fbo);
+    glGetIntegerv(GL_VIEWPORT, prev_vp);
+    glGetIntegerv(GL_ACTIVE_TEXTURE, &prev_unit);
+    glActiveTexture(GL_TEXTURE0 + Pipeline::kRockPuffHashUnit);
+    glGetIntegerv(GL_TEXTURE_BINDING_2D, &prev_tex);
+    const GLboolean depth_on = glIsEnabled(GL_DEPTH_TEST);
+    const GLboolean blend_on = glIsEnabled(GL_BLEND);
+    const GLboolean cull_on = glIsEnabled(GL_CULL_FACE);
+
+    GLuint tex = 0, fbo = 0, vao = 0;
+    glGenTextures(1, &tex);
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_R32F, n, n, 0, GL_RED, GL_FLOAT, nullptr);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glGenFramebuffers(1, &fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex, 0);
+    glViewport(0, 0, n, n);
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_BLEND);
+    glDisable(GL_CULL_FACE);
+    glGenVertexArrays(1, &vao);
+    pipeline.rock_puff_hash_shader().use();
+    glBindVertexArray(vao);
+    glDrawArrays(GL_TRIANGLES, 0, 3);   // one full-target triangle
+    glBindVertexArray(0);
+    glDeleteVertexArrays(1, &vao);
+    glDeleteFramebuffers(1, &fbo);
+    rock_puff_hash_tex_ = tex;
+
+    glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(prev_tex));
+    glActiveTexture(static_cast<GLenum>(prev_unit));
+    glBindFramebuffer(GL_FRAMEBUFFER, static_cast<GLuint>(prev_fbo));
+    glViewport(prev_vp[0], prev_vp[1], prev_vp[2], prev_vp[3]);
+    if (depth_on) glEnable(GL_DEPTH_TEST);
+    if (blend_on) glEnable(GL_BLEND);
+    if (cull_on) glEnable(GL_CULL_FACE);
+}
+
 void FarPass::render_rock_puffs(const glm::vec3& offset, const rockfield::PuffDials& d,
                                 const scenegraph::Camera& cam, Pipeline& pipeline,
                                 const Lighting& lighting, float ambient_scale) {
     if (rock_puff_count_ <= 0 || rock_puff_vao_ == 0) return;
+    if (rock_puff_hash_tex_ == 0) bake_rock_puff_hash(pipeline);
     Shader& s = pipeline.rock_puff_shader();
     s.use();
     s.set_mat4("u_view", cam.view_matrix());
     s.set_mat4("u_proj", cam.proj_matrix());
     const glm::vec3 eye = glm::vec3(glm::inverse(cam.view_matrix())[3]);
-    s.set_vec3("u_camera_pos_ws", eye);
     s.set_vec3("u_eye", eye);
     s.set_vec3("u_offset", offset);
     s.set_float("u_opacity", d.opacity);
@@ -556,10 +772,15 @@ void FarPass::render_rock_puffs(const glm::vec3& offset, const rockfield::PuffDi
     glEnable(GL_DEPTH_TEST);
     glDepthMask(GL_FALSE);
     glDisable(GL_CULL_FACE);
+    GLint prev_unit = 0;
+    glGetIntegerv(GL_ACTIVE_TEXTURE, &prev_unit);
+    glActiveTexture(GL_TEXTURE0 + Pipeline::kRockPuffHashUnit);
+    glBindTexture(GL_TEXTURE_2D, rock_puff_hash_tex_);
     glBindVertexArray(rock_puff_vao_);
     glDrawArraysInstanced(GL_TRIANGLE_STRIP, 0, 4, static_cast<GLsizei>(rock_puff_count_));
     ++draw_calls_;
     glBindVertexArray(0);
+    glActiveTexture(static_cast<GLenum>(prev_unit));
     glEnable(GL_CULL_FACE);
     glDepthMask(GL_TRUE);
     glBlendFuncSeparate(static_cast<GLenum>(blend_src_rgb), static_cast<GLenum>(blend_dst_rgb),

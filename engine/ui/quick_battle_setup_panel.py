@@ -98,6 +98,9 @@ class QuickBattleSetupPanel(Panel):
         self._entries: list = []
         self._index: dict = {}
         self._catalog_push_due = False
+        # The catalog prewarm() filled the caches for, so the first refresh
+        # keeps them rather than resetting.
+        self._warmed_generation = None
 
         from engine.quickbattle import spawn
         spawn.set_provider(self.current_plan)
@@ -201,32 +204,6 @@ class QuickBattleSetupPanel(Panel):
             except Exception as e:            # an unplannable setup must not
                 _log.warning("quickbattle SDK sync failed: %s", e)  # kill dispatch
 
-    def prewarm(self) -> None:
-        """Do the first open's slow work now, with no visible or SDK effect:
-        each listed ship's hull/shield stats (a hardpoint re-execution each,
-        ~2.4 s for the stock ships; persisted on disk after the first time),
-        the QuickBattle module import, the species icons and the bios.
-        Called once at boot -- opening the screen the first time used to freeze
-        the game for seconds (user report 2026-10-16). Never raises."""
-        import time
-        t0 = time.perf_counter()
-        try:
-            entries = list(self._catalog_fn())
-            self._qb()
-            for ce in entries:
-                self._stats.get(ce.ship_id)
-                self._icon(ce.icon)
-                try:
-                    self._bio_fn(ce)
-                except Exception:  # noqa: BLE001 - decoration only
-                    pass
-            for name, flagship in self._species_table_for(entries):
-                self._insignia(name)
-                self._icon(flagship)
-        except Exception as e:  # noqa: BLE001 - an optimisation must never break boot
-            _log.warning("quickbattle prewarm skipped: %s", e)
-        _log.info("quickbattle prewarm %.2fs", time.perf_counter() - t0)
-
     # ── Catalog ─────────────────────────────────────────────────────────
     def _refresh_catalog(self) -> None:
         entries = list(self._catalog_fn())
@@ -234,14 +211,18 @@ class QuickBattleSetupPanel(Panel):
         if gen == self._generation:
             return
         from engine.quickbattle import bios
+        # A first refresh over the catalog prewarm() warmed keeps its caches.
+        stale = self._generation is not None or gen != self._warmed_generation
+        self._warmed_generation = None
         self._generation = gen
         self._entries = entries
         self._index = sc.catalog_index(entries)
         sc.reconcile(self._scenario, self._index)
         if self._selected is not None and self._ce(self._selected) is None:
             self._selected = None
-        self._stats.reset()
-        bios.reset()
+        if stale:
+            self._stats.reset()
+            bios.reset()
         self._catalog_push_due = True
         # The reconcile may have changed the player or dropped rows; XO
         # Start/Restart bypass the panel, so the SDK must hear about it.
@@ -250,6 +231,29 @@ class QuickBattleSetupPanel(Panel):
         # game state there): it only fires on a catalog-generation change,
         # sync_sdk is idempotent, and current_plan() re-syncs at use anyway.
         self._after_change()
+
+    def prewarm(self) -> None:
+        """Fill the caches the first catalog push reads, so the first open
+        does not stall: the hull/shield probes (the bulk -- one hardpoint run
+        per ship, 1.4 s of a 1.5 s first open measured 2026-10-17), icons,
+        bios and insignia. host_loop calls it while Quick Battle loads.
+
+        Leaves the screen's own state alone: the catalog generation, the
+        scenario reconcile and the SDK sync all stay with the first real
+        refresh, exactly where they happened before. It does what a first
+        open did, only earlier and on every Quick Battle boot: imports the
+        ship and hardpoint modules (reloading loaded ones; the property
+        manager and part registry are restored, see stats.probe) and writes
+        the icon PNGs to the user cache."""
+        entries = list(self._catalog_fn())
+        self._warmed_generation = tuple(entries)
+        for ce in entries:
+            self._stats.get(ce.ship_id)
+            self._icon(ce.icon)
+            self._bio_fn(ce)
+        for name, flagship in self._species_table(entries):
+            self._insignia(name)
+            self._icon(flagship)
 
     def _ce(self, ship_id):
         return self._index.get((ship_id or "").lower())
@@ -260,17 +264,13 @@ class QuickBattleSetupPanel(Panel):
             return None
         return sc.battle_plan(self._scenario, self._index)
 
-    def _species_table(self) -> list:
+    def _species_table(self, entries=None) -> list:
         """STOCK_SPECIES in pill order, then any species the listed entries use
         that the table does not know, alphabetically -- catalog.species()'s
-        rule, applied to THIS panel's entries."""
-        return self._species_table_for(self._entries)
-
-    @staticmethod
-    def _species_table_for(entries) -> list:
+        rule, applied to THIS panel's entries (or `entries`)."""
         from engine.ship_catalog import STOCK_SPECIES
         known = {s.name.lower() for s in STOCK_SPECIES}
-        extra = sorted({e.species for e in entries
+        extra = sorted({e.species for e in (self._entries if entries is None else entries)
                         if e.species and e.species.lower() not in known}, key=str.lower)
         return [(s.name, s.flagship) for s in STOCK_SPECIES] + [(n, None) for n in extra]
 
@@ -279,8 +279,10 @@ class QuickBattleSetupPanel(Panel):
         if not stem:
             return None
         try:
+            # A file URL, not an inline data URL: the catalog lists every
+            # ship's icon at once (41 inline copies were 725 KB of the push).
             from engine.ui import ship_icons
-            return ship_icons.icon_path_for_species(stem) or None
+            return ship_icons.icon_file_url_for_species(stem) or None
         except Exception as e:                # decoration: costs only itself
             _log.info("quickbattle icon %r unavailable: %s", stem, e)
             return None
