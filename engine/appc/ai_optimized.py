@@ -17,7 +17,8 @@ bodies are DEAD CODE — the native nodes replace them at bind time. We have no
 native versions, so we run those Python bodies. Three of the four therefore need
 an entry here, for two different reasons:
 
-* ``ManagePower`` gets a REPLACEMENT (the class below). Its SDK Python body
+* ``ManagePower`` gets a REPLACEMENT (the class below), which also runs the
+  engine's power budget and split. Its SDK Python body
   (``AI/Preprocessors.py:2148``) is ``# Unused.  return PS_DONE`` — an explicit
   stub. PS_DONE maps to US_DONE, which DESTROYS the AI node. It sits in the live
   FedAttack / NonFedAttack / CloakAttack chain (AlertLevel -> PowerManagement ->
@@ -86,30 +87,140 @@ import os
 import App
 
 
+# ── ManagePower (cleanroom/spec/03_ManagePower_compiled.md) ─────────────────
+MANAGE_POWER_INTERVAL_S = 3.0
+# Battery threshold T as a fraction of the main-battery limit L.
+MANAGE_POWER_THRESHOLD = 0.9
+MANAGE_POWER_CONSERVE_THRESHOLD = 1.0625
+# Below the threshold the budget falls linearly from the plant's output toward
+# this fraction of it (reached on an empty battery).
+MANAGE_POWER_EMPTY_FRACTION = 0.1
+# No system is asked for more than this multiple of its normal demand.
+MANAGE_POWER_MAX_LEVEL = 1.25
+# Split weights; every other powered system weighs 1.
+MANAGE_POWER_SENSOR_WEIGHT = 0.25
+MANAGE_POWER_WARP_WEIGHT = 0.05
+
+
+def manage_power_budget(power, conserve) -> float:
+    """The power budget the AI splits among its ship's systems.
+
+    A = main battery power, L = its limit, P = plant output (already scaled by
+    the plant's condition), S = power available through the conduits:
+    min(A, main conduit capacity) + min(backup battery, backup conduit
+    capacity) -- which is what our battery-limited conduit getters return.
+
+    L <= 0 -> P. Otherwise T = 0.9 L (1.0625 L conserving), f = A / 2T below
+    T, else 1 - (L - A) / 2(L - T); f < 0.5 -> P*2f + 0.1P*(1 - 2f) (below the
+    output), else P*(2 - 2f) + (2f - 1)*S (the output at T, rising to S on a
+    full battery).
+    """
+    P = float(power.GetPowerOutput())
+    L = float(power.GetMainBatteryLimit())
+    if L <= 0.0:
+        return P
+    A = float(power.GetMainBatteryPower())
+    S = float(power.GetMainConduitCapacity()) + float(power.GetBackupConduitCapacity())
+    T = L * (MANAGE_POWER_CONSERVE_THRESHOLD if conserve else MANAGE_POWER_THRESHOLD)
+    if A < T:
+        f = 0.5 * A / T
+    else:
+        f = 1.0 - 0.5 * (L - A) / (L - T)
+    if f < 0.5:
+        return P * 2.0 * f + MANAGE_POWER_EMPTY_FRACTION * P * (1.0 - 2.0 * f)
+    return P * (2.0 - 2.0 * f) + (2.0 * f - 1.0) * S
+
+
+def _manage_power_weight(system) -> float:
+    from engine.appc.subsystems import SensorSubsystem, WarpEngineSubsystem
+    if isinstance(system, SensorSubsystem):
+        return MANAGE_POWER_SENSOR_WEIGHT
+    if isinstance(system, WarpEngineSubsystem):
+        return MANAGE_POWER_WARP_WEIGHT
+    return 1.0
+
+
+def _manage_power_demand(system) -> float:
+    """Normal demand: 0 when disabled or off, 0 for a tractor not firing,
+    else the system's normal power per second."""
+    from engine.appc.weapon_subsystems import TractorBeamSystem
+    if system.IsDisabled() or not system.IsOn():
+        return 0.0
+    if isinstance(system, TractorBeamSystem) and not system.IsFiring():
+        return 0.0
+    return float(system.GetNormalPowerPerSecond())
+
+
+def manage_power_systems(ship) -> list:
+    """Every powered system of `ship` taking part in the split: all but the
+    power plant (not a consumer) and the cloaking device (never touched)."""
+    from engine.appc.subsystems import CloakingSubsystem, PowerSubsystem
+    consumers = getattr(ship, "__dict__", {}).get("_powered_consumers") or ()
+    return [s for s in consumers
+            if not isinstance(s, (CloakingSubsystem, PowerSubsystem))]
+
+
+def manage_power_split(systems, budget) -> list:
+    """Split `budget` among `systems` by weight; returns [(system, level)].
+
+    Each pass gives every remaining system weight / W of the budget, as a
+    level of its normal demand (0 for no demand). Any level above 1.25 is set
+    to 1.25 and leaves the split, taking 1.25 x its demand off the budget and
+    its weight off W; the rest take their level. Repeat while anything was
+    capped. A system that wants no power keeps its weight: its share is lost.
+    """
+    entries = [(s, _manage_power_weight(s), _manage_power_demand(s)) for s in systems]
+    W = sum(w for _s, w, _d in entries)
+    levels: dict = {}
+    remaining = entries
+    while remaining and W > 0.0:
+        capped, kept = [], []
+        for s, w, d in remaining:
+            level = (w / W * budget) / d if d > 0.0 else 0.0
+            if level > MANAGE_POWER_MAX_LEVEL:
+                capped.append((s, w, d))
+            else:
+                kept.append((s, w, d))
+                levels[id(s)] = (s, level)
+        for s, w, d in capped:
+            levels[id(s)] = (s, MANAGE_POWER_MAX_LEVEL)
+            budget -= MANAGE_POWER_MAX_LEVEL * d
+            W -= w
+        if not capped:
+            break
+        remaining = kept
+    return list(levels.values())
+
+
 class ManagePower:
-    """Mirror of the native ManagePower CodeAI (ctor 0x00486FA0).
+    """The engine's ManagePower node, replacing the SDK's stub.
 
-    The native node drives the ship's power subsystem on a 3.0 s cadence
-    ([0x0088BEBC] = 3.0f, byte-for-byte the SDK's ``ManagePower.GetNextUpdateTime``),
-    reads ``bConservePower`` off the Python instance it replaces, and returns
-    PS_NORMAL so the wrapped combat subtree keeps running.
-
-    TODO (follow-up, deliberately not this task): the native node also *writes*
-    to the ship's power subsystem (``ship+0x2B0``; ours is
-    ``engine/appc/subsystems.py:PowerSubsystem``, reached via
-    ``ShipClass.GetPowerSubsystem``) to redistribute power under
-    ``bConservePower``. That behaviour is additive and belongs in its own task.
-    This class's job is to stop the AI deleting itself, which returning
-    PS_NORMAL on the native cadence does exactly.
+    Every 3.0 s it sets the wanted power level of each powered system on its
+    ship (manage_power_budget, manage_power_split), reading ``bConservePower``
+    off the Python instance it replaced (CloakAttack passes 1, FedAttack and
+    NonFedAttack 0). It always returns PS_NORMAL ("run the contained AI"):
+    NEVER PS_DONE, which would delete the whole combat subtree.
     """
 
     def __init__(self, bConservePower=0):
         self.bConservePower = bConservePower
 
     def GetNextUpdateTime(self):
-        return 3.0
+        return MANAGE_POWER_INTERVAL_S
 
-    def Update(self, dEndTime):
+    def _ship(self):
+        ai = self.__dict__.get("pCodeAI")
+        get_ship = getattr(ai, "GetShip", None) if ai is not None else None
+        return get_ship() if callable(get_ship) else None
+
+    def Update(self, dEndTime=None):
+        ship = self._ship()
+        power = ship.GetPowerSubsystem() if ship is not None else None
+        if power is not None:
+            budget = manage_power_budget(power, bool(self.bConservePower))
+            for system, level in manage_power_split(
+                    manage_power_systems(ship), budget):
+                system.SetPowerPercentageWanted(level)
         # PS_NORMAL: run the contained AI. NEVER PS_DONE — that is lethal.
         return App.PreprocessingAI.PS_NORMAL
 
