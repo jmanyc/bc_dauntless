@@ -17,8 +17,10 @@ This file proves:
   1. The base ArtificialIntelligence.SetActive/SetInactive edge guard.
   2. ConditionalAI drives its condition list from real dispatch (no hand
      calls), via a PriorityListAI whose picked child changes.
-  3. AddCondition on a not-yet-active node must NOT activate the condition;
-     on an already-active node it must.
+  3. A condition is active from AddCondition and stays active when its node
+     leaves the active path (measured: the original's polled conditions keep
+     evaluating in branches it never runs). Node activation still calls the
+     condition's Activate() -- that is what re-arms a timer (4).
   4. End-to-end with the REAL SDK Conditions.ConditionTimer, driven purely by
      tick_ai + the game clock -- no SetActive() called by hand anywhere. This
      is the proof that the bug described above is actually fixed.
@@ -92,19 +94,28 @@ def test_conditional_ai_activates_and_deactivates_conditions_via_dispatch():
     root.AddAI(a, 0)   # higher priority (lower int)
     root.AddAI(b, 1)
 
+    # A condition is active from wiring and stays active whatever its node
+    # does: the original's polled conditions keep evaluating in branches it
+    # never runs (FedAttack's ConditionFacingToward matches the real geometry
+    # on 99% of samples -- engine/appc/ai.py ConditionalAI.AddCondition).
     tick_ai(root, 0.0)
     assert a._is_active_in_tree is True
     assert b._is_active_in_tree is False
     assert cond_a.IsActive() == 1
-    assert cond_b.IsActive() == 0
+    assert cond_b.IsActive() == 1, "wired conditions are active before their node runs"
 
-    # A's EvalFunc goes DORMANT -> the priority list skips it and picks B.
+    # A's EvalFunc goes DORMANT -> the priority list skips it and picks B. A,
+    # scanned above the running child, STAYS active in the tree so its
+    # conditions keep evaluating -- else a polled condition freezes and A can
+    # never wake. Measured on the original (stbc-oracle OracleAIProbe IsActive):
+    # FedAttack's priority-1 branch is active exactly as long as its list while
+    # it has focus a fraction of that time (engine/appc/ai_driver.py).
     flags["a"] = False
     tick_ai(root, 1.0)
-    assert a._is_active_in_tree is False
+    assert a._is_active_in_tree is True, "a dormant higher-priority branch stays active"
     assert b._is_active_in_tree is True
-    assert cond_a.IsActive() == 0, "A dropped off the path -> its conditions deactivate"
-    assert cond_b.IsActive() == 1, "B was picked back up -> its conditions activate"
+    assert cond_a.IsActive() == 1, "A's conditions keep evaluating while it is dormant"
+    assert cond_b.IsActive() == 1, "B was picked up -> its conditions activate"
 
     # A regains eligibility -> the priority list picks it back up.
     flags["a"] = True
@@ -112,23 +123,24 @@ def test_conditional_ai_activates_and_deactivates_conditions_via_dispatch():
     assert a._is_active_in_tree is True
     assert b._is_active_in_tree is False
     assert cond_a.IsActive() == 1
-    assert cond_b.IsActive() == 0
+    assert cond_b.IsActive() == 1, "B left the active path but its conditions keep evaluating"
 
 
-# ── 3. AddCondition gates on the node's current tree-activation state ──────
+# ── 3. A wired condition is active, and node deactivation leaves it so ─────
 
-def test_add_condition_only_activates_immediately_on_an_already_active_node():
+def test_a_wired_condition_is_active_and_stays_active():
     node = ConditionalAI_Create(None, "n")
     cond1 = TGCondition()
     node.AddCondition(cond1)
-    assert cond1.IsActive() == 0, "node is not yet active in the tree"
+    assert cond1.IsActive() == 1, "active from wiring, before the node runs"
 
-    node.SetActive()   # node becomes active in the tree
-    assert cond1.IsActive() == 1, "pre-existing condition activates with the node"
+    node.SetActive()
+    node.SetInactive()   # node leaves the active path
+    assert cond1.IsActive() == 1, "its conditions keep evaluating"
 
     cond2 = TGCondition()
     node.AddCondition(cond2)
-    assert cond2.IsActive() == 1, "late-added condition on an already-active node activates immediately"
+    assert cond2.IsActive() == 1
 
 
 # ── 4. End-to-end proof: the real SDK ConditionTimer re-arms ───────────────

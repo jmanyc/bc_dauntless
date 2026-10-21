@@ -135,9 +135,10 @@ def test_two_ships_focus_isolated():
 # StopFiring(). If BC dropped a ship's shields every time it dodged, dodging
 # would be suicide.
 #
-# Focus only. Tree activation (SetActive/SetInactive, _reconcile_active) asks a
-# different question -- "did dispatch reach this node" -- whose answer really is
-# no, and conditions are edge-guarded and re-arm when the skip ends.
+# Activation is carried as well (2026-10-17, measured: the original keeps the
+# skipped attack tree active while AvoidObstacles holds the speed command; see
+# ai_driver._retain_subtree_focus). Letting it lapse re-armed every
+# ConditionTimer under the tree at the 0.25 s evading cadence.
 
 class _SkipActive:
     """A preprocessor that suppresses its child the way AvoidObstacles does."""
@@ -205,3 +206,33 @@ def test_a_child_that_really_leaves_the_path_still_loses_focus():
     ia.result = PS_SKIP_DORMANT
     tick_ai(pl, 1.0)
     assert ia.lost == 1
+
+
+def test_activation_survives_a_skip_so_timers_do_not_rearm():
+    """Measured on the original (stbc-oracle speed-command rows attributed to AvoidObstacles): while
+    avoidance held a Galor's speed command, FireAll / CloseRange / CloseRangePriorities stayed active (29/29
+    samples). A subtree that lapsed and came back re-armed every bResetOnActivate ConditionTimer under it."""
+    guard = _SkipActive()
+    child_inst = _WithLostFocus()
+    child = _pp(child_inst, "Attack")
+    root = _pp_containing(guard, "AvoidObstacles", child)
+    activations = []
+    orig = type(child).SetActive
+
+    def counting(self, *a, **k):
+        if not self._is_active_in_tree:
+            activations.append(self.GetName())
+        return orig(self, *a, **k)
+    type(child).SetActive = counting
+    try:
+        tick_ai(root, 0.0)
+        assert child._is_active_in_tree
+        guard.result = PreprocessingAI.PS_SKIP_ACTIVE
+        for t in range(1, 10):
+            tick_ai(root, float(t))
+            assert child._is_active_in_tree, "the skipped subtree went inactive at t=%d" % t
+        guard.result = PreprocessingAI.PS_NORMAL
+        tick_ai(root, 10.0)
+    finally:
+        type(child).SetActive = orig
+    assert activations.count("Attack") == 1, activations

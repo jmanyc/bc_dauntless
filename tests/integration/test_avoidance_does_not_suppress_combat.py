@@ -78,8 +78,17 @@ def _alert_level_nodes():
 
     found = []
 
+    from engine.appc.ai import ArtificialIntelligence, ConditionalAI
+
     def walk(node):
         if node is None:
+            return
+        # A branch whose ConditionalAI is dormant is meant to stay unfocused.
+        # It is now BUILT and active in the tree (the original activates a
+        # scanned dormant branch's whole path -- ai_driver.
+        # _mark_branch_for_activation), so its AlertLevel exists; the
+        # cloaking ships' CloakingDisabled -> NonFedAttack is the stock case.
+        if isinstance(node, ConditionalAI) and node._status == ArtificialIntelligence.US_DORMANT:
             return
         inst = getattr(node, "_preprocessing_instance", None)
         if inst is not None and type(inst).__name__ == "AlertLevel":

@@ -86,9 +86,10 @@ def test_fleet_command_override_reparent_deactivates_and_later_reactivates():
     assert old_ai._is_active_in_tree is False, (
         "re-parented subtree must not be stranded active by its old root"
     )
-    assert timer.IsActive() == 0, (
-        "the old condition must be unregistered while its branch is overridden"
-    )
+    # Its conditions stay active (the original's polled conditions keep
+    # evaluating in branches it is not running -- engine/appc/ai.py
+    # ConditionalAI.AddCondition); what matters is the NODE edge below.
+    assert timer.IsActive() == 1
 
     # Advance well past the timer's cadence while overridden -- with the bug,
     # a still-"active" timer would keep re-arming/firing on its own even

@@ -100,6 +100,129 @@ def tick_ai(ai, game_time: float) -> int:
     return status
 
 
+def _mark_reached_for_activation(node) -> None:
+    """Record `node` as on the tree's ACTIVE path this root tick (SetActive via
+    _reconcile_active) without dispatching it -- for a dormant ConditionalAI a
+    priority list scans. The same identity-dedup as _dispatch_ai's record."""
+    node_id = id(node)
+    if node_id not in _reached_this_tick_all_ids:
+        _reached_this_tick_all_ids.add(node_id)
+        _reached_this_tick_all.append(node)
+
+
+def _holds_uninterruptable(node, depth: int = 0) -> bool:
+    """True if `node` is running (US_ACTIVE) and its running path holds a node
+    built with SetInterruptable(0).
+
+    Measured on the original (stbc-oracle duels_ai, Galaxy/Sovereign, xy focus
+    vs xk condition rows): FedAttack's TorpRun_3 sits in
+    TorpsReadyNotInterruptable (SetInterruptable(0)) under
+    TorpsReadyAndNotInEnemyFiringArc, whose EvalFunc needs "not in the enemy's
+    phaser arc". On 636 of 1,224 samples where TorpRun_3 had focus, that arc
+    condition was TRUE -- the parent would have gone dormant, and the run
+    carried on. A running uninterruptable node holds its ancestors and its
+    priority list; only its own conditions end it. Dauntless honoured the flag
+    only for a preprocessor's direct child, so the run was dropped the moment
+    the turn brought the ship into the enemy's arc (TorpRun_3 4-5% of a fight
+    vs the original's 20%)."""
+    if node is None or depth > 32 or getattr(node, "_status", None) != US_ACTIVE:
+        return False
+    d = getattr(node, "__dict__", {})
+    if not d.get("_interruptable", True):
+        # Only a run that is actually RUNNING holds: its path must end at a
+        # leaf that has focus. A PlainAI keeps US_ACTIVE after it last ran, so
+        # without this a FollowThroughWarp WarpFollow (SetInterruptable(0),
+        # Update ACTIVE for ever while the target is in the same set) touched
+        # once at tree build, when ConditionAnyInSameSet had not yet initialised,
+        # came back to hold a fighting Akira for the rest of the duel.
+        return _path_has_focus(node, depth + 1)
+    if isinstance(node, (ConditionalAI, PreprocessingAI)):
+        return _holds_uninterruptable(d.get("_contained_ai"), depth + 1)
+    if isinstance(node, PriorityListAI):
+        # The child it dispatched last (containers carry no _has_focus here).
+        return _holds_uninterruptable(d.get("_running_child"), depth + 1)
+    if isinstance(node, SequenceAI):
+        kids = node._ais
+        i = d.get("_current_index", 0)
+        return bool(kids) and 0 <= i < len(kids) and _holds_uninterruptable(kids[i], depth + 1)
+    if isinstance(node, RandomAI):
+        return _holds_uninterruptable(d.get("_current_child"), depth + 1)
+    return False
+
+
+def _path_has_focus(node, depth: int = 0) -> bool:
+    """True if `node`'s running path ends at a leaf that has focus now."""
+    if node is None or depth > 32 or getattr(node, "_status", None) != US_ACTIVE:
+        return False
+    d = getattr(node, "__dict__", {})
+    if isinstance(node, (ConditionalAI, PreprocessingAI)):
+        return _path_has_focus(d.get("_contained_ai"), depth + 1)
+    if isinstance(node, PriorityListAI):
+        return _path_has_focus(d.get("_running_child"), depth + 1)
+    if isinstance(node, SequenceAI):
+        kids = node._ais
+        i = d.get("_current_index", 0)
+        return bool(kids) and 0 <= i < len(kids) and _path_has_focus(kids[i], depth + 1)
+    if isinstance(node, RandomAI):
+        return _path_has_focus(d.get("_current_child"), depth + 1)
+    return bool(d.get("_has_focus", False))
+
+
+def _mark_branch_for_activation(node, depth: int = 0) -> None:
+    """Activate a dormant branch's would-be active path, without dispatching.
+
+    The original keeps a scanned dormant branch's whole path active, not just
+    its top node: a cloaking ship's CloakAttackWrapper holds an ordinary
+    attack AI (NonFedAttack) inside the dormant "CloakingDisabled" branch, and
+    on stbc.exe that branch is active 99% of the fight and the preprocessors
+    inside it (FireAll, FireAll2, FirePulseOnly) 100%, while their conditions
+    keep evaluating (UseSideArcs, AggressivePulseWeapons true 100%,
+    PulseReady 40-69%, TorpsReady 45-67% -- stbc-oracle duels_ai,
+    Warbird/BirdOfPrey, OracleAIProbe xv/xk rows). That matters beyond the
+    branch: condition scripts share state by name (ConditionIncomingTorps keeps
+    one watcher per (ship, firing object)), and a shared watcher whose code
+    conditions all go inactive drops its own PeriodicCheck and latches its last
+    answer. In Dauntless the branch's BuilderAI was never even built (it builds
+    on first dispatch), so a Bird of Prey's (self, enemy) torpedo watcher
+    latched a missed plasma torpedo and the ship evaded 95% of the fight
+    (original 34-64%), and its forward cannons almost never bore.
+
+    Walk: a BuilderAI is built on activation; a PreprocessingAI or
+    ConditionalAI passes to its contained AI; a list walks its children the way
+    its own scan would (ConditionalAI children refreshed, dormant ones activated
+    and passed over, the first live child followed); a sequence or random node
+    follows its current child. PlainAIs are leaves and stay inactive."""
+    if node is None or depth > 32:
+        return
+    if isinstance(node, BuilderAI) and not node._activated and not node._activation_failed:
+        _activate_builder(node)
+    if isinstance(node, ConditionalAI):
+        _mark_reached_for_activation(node)
+        _mark_branch_for_activation(node._contained_ai, depth + 1)
+    elif isinstance(node, PreprocessingAI):
+        _mark_reached_for_activation(node)
+        _mark_branch_for_activation(node.__dict__.get("_contained_ai"), depth + 1)
+    elif isinstance(node, PriorityListAI):
+        _mark_reached_for_activation(node)
+        for _prio, child in node._ais:
+            if isinstance(child, ConditionalAI):
+                _refresh_conditional_status(child)
+            if child._status == US_DONE:
+                continue
+            _mark_branch_for_activation(child, depth + 1)
+            if child._status != US_DORMANT:
+                break
+    elif isinstance(node, SequenceAI):
+        _mark_reached_for_activation(node)
+        kids = node._ais
+        if kids:
+            i = getattr(node, "_current_index", 0)
+            _mark_branch_for_activation(kids[i if 0 <= i < len(kids) else 0], depth + 1)
+    elif isinstance(node, RandomAI):
+        _mark_reached_for_activation(node)
+        _mark_branch_for_activation(node.__dict__.get("_current_child"), depth + 1)
+
+
 def _dispatch_ai(ai, game_time: float) -> int:
     """Type-dispatch one AI node (the former body of tick_ai)."""
     if ai is None:
@@ -356,10 +479,18 @@ def _retain_subtree_focus(ai) -> None:
     targetless SelectTarget — and a dormant subtree really has left the path,
     which is what test_lost_focus_when_node_drops_off_active_path pins.
 
-    Focus only, deliberately. Tree activation (_reconcile_active,
-    SetActive/SetInactive) answers a different question — "did dispatch reach
-    this node" — whose answer really is no; those calls are edge-guarded and
-    re-arm when the skip ends.
+    Activation is carried too (2026-10-17). It used to be left to lapse ("did
+    dispatch reach this node -- no"), but the original keeps a skipped subtree
+    ACTIVE: in a Galor-vs-Galaxy capture with the native speed-command hook
+    (stbc-oracle speed-command rows attributed to AvoidObstacles), every
+    sample where avoidance held the Galor's speed command still had FireAll,
+    CloseRange and CloseRangePriorities active (29/29). Letting it lapse cost
+    far more than a flag: avoidance re-decides every 0.25 s while evading
+    (AVOID_EVADING_UPDATE_DELAY_S), so the subtree went inactive and active again
+    on alternate scans, and every ConditionTimer under it with bResetOnActivate
+    re-armed each time (Activate). A Galaxy's SignificantTimePassed (10 s) was
+    true 52% of the time against 88% in the original, so it seldom made its
+    torpedo runs and sat in ICO_WeaponBias at close range (43% vs 20%).
     """
     node = ai._contained_ai
     if node is None:
@@ -369,6 +500,8 @@ def _retain_subtree_focus(ai) -> None:
         n = stack.pop()
         if n.__dict__.get("_has_focus"):
             _reached_this_tick.append(n)
+        if n.__dict__.get("_is_active_in_tree"):
+            _mark_reached_for_activation(n)
         child = n.__dict__.get("_contained_ai")
         if child is not None:
             stack.append(child)
@@ -650,6 +783,15 @@ def _tick_priority_list(ai: PriorityListAI, game_time: float) -> int:
     # PreprocessingAI now gets a re-evaluation probe: if it reactivates it takes
     # the list; if it stays dormant we roll back its focus bookkeeping and keep
     # walking to lower-priority siblings, just as skipping it would have.
+    # A focused child whose running path holds an uninterruptable node keeps
+    # the list: no higher-priority sibling pre-empts it (_holds_uninterruptable).
+    held = ai.__dict__.get("_running_child")
+    if held is not None and held._status != US_DONE and _holds_uninterruptable(held):
+        if isinstance(held, ConditionalAI):
+            _refresh_conditional_status(held)
+        if held._status == US_ACTIVE and _dispatch_priority_child(held, game_time) == US_ACTIVE:
+            ai._status = US_ACTIVE
+            return ai._status
     for _prio, child in ai._ais:
         # Re-evaluate each ConditionalAI child's status against its
         # current condition values *before* deciding eligibility.
@@ -664,6 +806,24 @@ def _tick_priority_list(ai: PriorityListAI, game_time: float) -> int:
         # never dispatched and no phasers fired.
         if isinstance(child, ConditionalAI):
             _refresh_conditional_status(child)
+            # A ConditionalAI the list SCANS is active in the tree even while
+            # dormant: its conditions must keep evaluating or it can never wake.
+            # Measured on the original (stbc-oracle OracleAIProbe, IsActive of
+            # every node of a FedAttack tree): the priority-1 branch
+            # "TorpsReadyAndNotInEnemyFiringArc" is active exactly as long as its
+            # list (Galaxy: 60.1% = TooFar 60.1%) while it has focus only 14%,
+            # and the priority-3 branch is active 46.0% = 60.1% less the 14.0%
+            # when priority 1 runs -- every child at or above the running one is
+            # active, those below are not. Dauntless refreshed a dormant branch's
+            # status but never activated it, so its polled conditions
+            # (ConditionInPhaserFiringArc / FacingToward / IncomingTorps, whose
+            # PeriodicCheck runs only `if self.pCodeCondition.IsActive()`) froze
+            # at their creation value and a re-armable ConditionTimer latched:
+            # the AI rarely made torpedo runs (half the original's torpedoes) and
+            # never evaded torpedoes. Activation only -- the dormant child is not
+            # dispatched and takes no focus.
+            if child._status == US_DORMANT:
+                _mark_branch_for_activation(child)
         if child._status == US_DONE:
             continue
         if child._status == US_DORMANT:
@@ -680,6 +840,7 @@ def _tick_priority_list(ai: PriorityListAI, game_time: float) -> int:
             # would have) to lower-priority siblings.
             if _dispatch_priority_child(child, game_time) == US_ACTIVE:
                 ai._status = US_ACTIVE
+                ai.__dict__["_running_child"] = child
                 return ai._status
             continue
         # Active child: dispatch it and hold the walk here — one active child
@@ -690,6 +851,9 @@ def _tick_priority_list(ai: PriorityListAI, game_time: float) -> int:
         # the prior one-child-per-tick dispatch.
         if _dispatch_priority_child(child, game_time) == US_ACTIVE:
             ai._status = US_ACTIVE
+            ai.__dict__["_running_child"] = child
+        else:
+            ai.__dict__["_running_child"] = None
         return ai._status  # one child per tick (SDK semantics)
     # All children dormant/done or list empty. Preserve the historical tail:
     # only latch the list itself DONE when every child is DONE. (BC additionally
@@ -863,6 +1027,27 @@ def _eval_conditional(ai, eval_fn, args):
     return status
 
 
+def _contained_conditional_dormant(ai: ConditionalAI, refresh: bool = False) -> bool:
+    """True when an ACTIVE ConditionalAI's contained AI is itself a ConditionalAI that is dormant.
+
+    Such a branch has nothing to run, and BC's priority list passes over it to the next sibling (its
+    IsDormant probe recurses into the contained subtree; PriorityListAI::Update 0x00490340). Measured on
+    the original (stbc-oracle results_win/duels_ai_matrix, Galaxy FedAttack, 31,169 samples inside
+    TooClose): FrontTorpsReadyFrontShieldsOk -- active whenever torpedoes are ready -- held focus ONLY
+    while its contained SignificantTimePassed (a 10 s ConditionTimer) did; otherwise the list ran
+    UseSideArcs_ShortTime / ICO_MoveWithWeapons / Flee below it. Dauntless gave the list to the active
+    outer branch and stopped there, so nothing ran and the ship coasted on its last command (14.8% of a
+    Galaxy's fight time, matrix r2), lingering at close range.
+    The branch stays ACTIVE in the tree (its conditions keep evaluating, as for any scanned dormant
+    child) -- it only stops holding the list."""
+    inner = ai._contained_ai
+    if not isinstance(inner, ConditionalAI):
+        return False
+    if refresh:
+        _refresh_conditional_status(inner)
+    return inner._status == US_DORMANT
+
+
 def _refresh_conditional_status(ai: ConditionalAI) -> None:
     """Re-run a ConditionalAI's EvalFunc against its conditions and
     cache the result on ``ai._status`` without dispatching contained
@@ -876,7 +1061,10 @@ def _refresh_conditional_status(ai: ConditionalAI) -> None:
     eval_fn = ai._evaluation_function
     if eval_fn is not None:
         args = [c.GetStatus() for c in ai._conditions]
+        held = ai._status == US_ACTIVE and _holds_uninterruptable(ai._contained_ai)
         ai._status = _eval_conditional(ai, eval_fn, args)
+        if held and ai._status != US_DONE:
+            ai._status = US_ACTIVE            # see _holds_uninterruptable
         # Fold in the contained AI's completion (see _tick_conditional):
         # an EvalFunc that reports US_ACTIVE forever must not mask a
         # contained AI that has already finished.
@@ -892,6 +1080,8 @@ def _refresh_conditional_status(ai: ConditionalAI) -> None:
         if (ai._status == US_ACTIVE and ai._contained_ai is not None
                 and ai._contained_ai._status == US_DONE):
             ai._status = US_DONE
+        elif ai._status == US_ACTIVE and _contained_conditional_dormant(ai, refresh=True):
+            ai._status = US_DORMANT
         return
     if not ai._conditions:
         return
@@ -950,6 +1140,16 @@ def _tick_sequence(ai: SequenceAI, game_time: float) -> int:
                 return ai._status
         child = ai._ais[idx]
         if isinstance(child, ConditionalAI):
+            # A sequence's child is activated as the sequence reaches it, BEFORE its conditions are read:
+            # activation re-arms its ConditionTimers (bResetOnActivate). Reading the stale conditions first
+            # wedged CloakAttack's OuterSequence -- FarEnough_TimeNotPassed (15 s timer) and
+            # TooClose_ShortTime (60 s timer) both still read their old, expired timers, both answered
+            # DONE, and the loop spun at point blank: a Vor'cha's state "within 50 GU, 15 s passed, within
+            # 100 GU, 60 s passed" held 25.5% of the fight in Dauntless against 1.5% in the original
+            # (stbc-oracle matrix, OracleAIProbe xk rows).
+            if not child._is_active_in_tree:
+                child.SetActive()
+                _mark_reached_for_activation(child)
             _refresh_conditional_status(child)
         if child._status == US_DORMANT:
             if int(getattr(ai, "_skip_dormant", 0)):
@@ -1025,7 +1225,10 @@ def _tick_conditional(ai: ConditionalAI, game_time: float) -> int:
     eval_fn = ai._evaluation_function
     if eval_fn is not None:
         args = [c.GetStatus() for c in ai._conditions]
+        held = ai._status == US_ACTIVE and _holds_uninterruptable(ai._contained_ai)
         ai._status = _eval_conditional(ai, eval_fn, args)
+        if held and ai._status != US_DONE:
+            ai._status = US_ACTIVE            # an uninterruptable run below holds this branch
         if ai._status == US_ACTIVE and ai._contained_ai is not None:
             tick_ai(ai._contained_ai, game_time)
             # Fold in the contained AI's completion. Some EvalFuncs (SDK
@@ -1044,6 +1247,8 @@ def _tick_conditional(ai: ConditionalAI, game_time: float) -> int:
             # _refresh_conditional_status, which carries the longer note.
             if ai._contained_ai._status == US_DONE:
                 ai._status = US_DONE
+            elif _contained_conditional_dormant(ai):
+                ai._status = US_DORMANT       # see _contained_conditional_dormant
         return ai._status
     active = any(c.GetStatus() != 0 for c in ai._conditions) if ai._conditions else False
     if not active:

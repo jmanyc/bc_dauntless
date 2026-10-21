@@ -1106,14 +1106,24 @@ class ConditionalAI(ArtificialIntelligence, TGConditionHandler):
         register = getattr(cond, "RegisterExternalFunctions", None)
         if callable(register):
             register(self)
-        # Appc's ConditionalAI drives SetActive/SetInactive across its
-        # condition list from the NODE's own tree-activation lifecycle (see
-        # _on_activated/_on_deactivated below), not at wiring time. A
-        # condition added to a node that isn't active in the tree yet must
-        # stay inactive until the node itself activates; a condition added
-        # to an already-active node (late add on a live branch) activates
-        # immediately so it isn't left stranded.
-        if self._is_active_in_tree:
+        # A condition is active from the moment it is wired, whether or not
+        # its node ever runs. Measured on the original (stbc-oracle duels_ai,
+        # Galaxy vs Sovereign, OracleAIProbe xk rows against the ships' poses):
+        # FedAttack's ConditionFacingToward lives in
+        # TorpsStillReadyFacingTowardNotInterruptable, a branch the original
+        # never reports active, yet its status matches the real geometry on
+        # 98.9-99.2% of samples from the first second -- its PeriodicCheck,
+        # which runs only `if self.pCodeCondition.IsActive()`, never stopped.
+        # Dauntless activated a condition only with its node and deactivated
+        # it when the node left the active path, so the four polled
+        # conditions (FacingToward, InPhaserFiringArc, InLineOfSight,
+        # IncomingTorps) froze at their last value: FacingToward read true
+        # 97-98% of a fight (geometry: 28%) and gated FedAttack's
+        # "torps ready and not in the enemy's arc" run (TorpRun_3: 4.5% vs the
+        # original's 20.7%). Node activation still calls the condition's
+        # Activate() (ConditionTimer re-arms there) -- see _on_activated.
+        set_active = getattr(type(cond), "SetActive", None)   # bare test doubles have none
+        if set_active is not None:
             cond.SetActive()
 
     def GetConditions(self) -> list:
@@ -1131,8 +1141,10 @@ class ConditionalAI(ArtificialIntelligence, TGConditionHandler):
             cond.SetActive()
 
     def _on_deactivated(self) -> None:
-        for cond in self._conditions:
-            cond.SetInactive()
+        # Conditions stay active when their node leaves the active path (see
+        # AddCondition): the original's polled conditions keep evaluating.
+        # No stock condition defines Deactivate(), so nothing else is lost.
+        pass
 
 
 def ConditionalAI_Create(pShip=None, name: str = "") -> ConditionalAI:
